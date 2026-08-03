@@ -16,9 +16,13 @@ import { parseSseChunk, type ParsedSseChunk } from '@/lib/tarot/sseUtils';
 // ─── 配置 ───────────────────────────────────────────────────────
 
 export interface StreamClientConfig {
-  /** 初始 fetch 的超时(毫秒)。默认 30s */
+  /** 初始 fetch 的超时(毫秒)。默认 60s（思考模型首包可能较慢） */
   connectTimeoutMs?: number;
-  /** 流中两次数据之间的最大空闲时间(毫秒)。默认 15s */
+  /**
+   * 流中两次下行字节之间的最大空闲时间(毫秒)。
+   * 服务端会以 ~15s 间隔发送 SSE 心跳注释，因此此值只需覆盖「心跳丢失」窗口，
+   * 不再需要等于思考静默时长。默认 60s。
+   */
   streamIdleTimeoutMs?: number;
   /** 最大自动重试次数(仅对 retryable 错误)。默认 2 */
   maxRetries?: number;
@@ -29,8 +33,8 @@ export interface StreamClientConfig {
 }
 
 const DEFAULT_CONFIG: Required<Omit<StreamClientConfig, 'signal'>> = {
-  connectTimeoutMs: 30_000,
-  streamIdleTimeoutMs: 30_000,
+  connectTimeoutMs: 60_000,
+  streamIdleTimeoutMs: 60_000,
   maxRetries: 2,
   retryBaseMs: 1000,
 };
@@ -215,6 +219,39 @@ async function doStreamRequest(
   let thinkingBlockOpen = false;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // 回调节流：长思考时 token 极密，逐 chunk 触发 React setState 会卡死 UI。
+  // fullText 仍即时累积；仅对 onContent / onThinking 做合并派发。
+  type PendingKind = 'thinking' | 'content';
+  const pendingEvents: Array<{ kind: PendingKind; text: string }> = [];
+  let callbackFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  const CALLBACK_FLUSH_MS = 80;
+
+  const flushCallbacks = (): void => {
+    if (callbackFlushTimer) {
+      clearTimeout(callbackFlushTimer);
+      callbackFlushTimer = null;
+    }
+    if (pendingEvents.length === 0) return;
+    const batch = pendingEvents.splice(0, pendingEvents.length);
+    for (const event of batch) {
+      if (event.kind === 'thinking') callbacks.onThinking?.(event.text);
+      else callbacks.onContent?.(event.text);
+    }
+  };
+
+  const enqueueCallback = (kind: PendingKind, text: string): void => {
+    if (!text) return;
+    const last = pendingEvents.at(-1);
+    if (last && last.kind === kind) {
+      last.text += text;
+    } else {
+      pendingEvents.push({ kind, text });
+    }
+    if (!callbackFlushTimer) {
+      callbackFlushTimer = setTimeout(flushCallbacks, CALLBACK_FLUSH_MS);
+    }
+  };
+
   const append = (chunk: string): void => {
     if (!chunk) return;
     fullText += chunk;
@@ -224,7 +261,7 @@ async function doStreamRequest(
     if (thinkingBlockOpen) return;
     const prefix = fullText ? '\n\n<think>\n' : '<think>\n';
     append(prefix);
-    callbacks.onThinking?.(prefix);
+    enqueueCallback('thinking', prefix);
     thinkingBlockOpen = true;
   };
 
@@ -232,7 +269,7 @@ async function doStreamRequest(
     if (!thinkingBlockOpen) return;
     const suffix = '\n</think>\n\n';
     append(suffix);
-    callbacks.onThinking?.(suffix);
+    enqueueCallback('thinking', suffix);
     thinkingBlockOpen = false;
   };
 
@@ -245,15 +282,17 @@ async function doStreamRequest(
     if (parsed.thinking) {
       openThinking();
       append(parsed.thinking);
-      callbacks.onThinking?.(parsed.thinking);
+      enqueueCallback('thinking', parsed.thinking);
     }
     if (parsed.content) {
       closeThinking();
       append(parsed.content);
-      callbacks.onContent?.(parsed.content);
+      enqueueCallback('content', parsed.content);
     }
     if (parsed.error) {
       receivedError = true;
+      // 错误立即派发，不进节流队列
+      flushCallbacks();
       callbacks.onStreamError?.(parsed.error);
     }
     if (parsed.truncated) {
@@ -265,7 +304,7 @@ async function doStreamRequest(
   const resetIdleTimer = (): void => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      // 流空闲超时 → 中止
+      // 流空闲超时 → 中止（服务端心跳会重置此计时器，因此只在连接真正假死时触发）
       controller.abort();
     }, cfg.streamIdleTimeoutMs);
   };
@@ -277,6 +316,7 @@ async function doStreamRequest(
       const { done, value } = await reader.read();
       if (done) break;
 
+      // 任何下行字节都重置空闲计时（含 SSE 心跳注释 `: keepalive`）
       resetIdleTimer();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -305,8 +345,10 @@ async function doStreamRequest(
     }
 
     closeThinking();
+    flushCallbacks();
   } catch (err) {
     closeThinking();
+    flushCallbacks();
 
     if (err instanceof DOMException && err.name === 'AbortError') {
       if (externalSignal?.aborted) {
@@ -336,6 +378,7 @@ async function doStreamRequest(
     }
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
+    if (callbackFlushTimer) clearTimeout(callbackFlushTimer);
     reader.releaseLock();
     externalSignal?.removeEventListener('abort', onExternalAbort);
   }

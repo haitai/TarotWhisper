@@ -8,6 +8,11 @@ import {
   buildDailyInterpretationPrompt,
 } from '@/lib/api/prompts';
 
+// Vercel / 兼容平台：允许长时间流式响应（思考模型 + 长解读可达数分钟）
+// Hobby 最高 60s，Pro 最高 300s；超出套餐上限时平台会自动 clamp
+export const maxDuration = 300;
+export const runtime = 'nodejs';
+
 // ─── 类型定义 ────────────────────────────────────────────────
 
 type FollowUpMode = 'decide' | 'direct' | 'with-extras';
@@ -47,8 +52,8 @@ interface InterpretRequest {
 
 // ─── 常量配置 ────────────────────────────────────────────────
 
-/** 上游 LLM 请求的超时时间（毫秒） */
-const UPSTREAM_TIMEOUT_MS = 120_000;
+/** 上游 LLM 首字节连接超时（毫秒）——仅覆盖建连 + 首包，不限制整段流时长 */
+const UPSTREAM_TIMEOUT_MS = 180_000;
 
 /** LLM 输出的最大 token 数 */
 const MAX_OUTPUT_TOKENS = 65_536;
@@ -333,8 +338,10 @@ export async function POST(request: NextRequest): Promise<Response> {
   return new Response(transformedStream, {
     headers: {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
+      // 禁止 nginx / 网关缓冲 SSE（长思考时尤为关键）
+      'X-Accel-Buffering': 'no',
       ...(usingFallback && { 'X-Using-Fallback': 'true' }),
     },
   });
@@ -357,58 +364,102 @@ function mapUpstreamStatus(upstreamStatus: number): number {
   }
 }
 
-// ─── 带超时保护的流透传 ─────────────────────────────────────
+// ─── 带超时保护 + 心跳的流透传 ─────────────────────────
 
-const STREAM_CHUNK_TIMEOUT_MS = 60_000; // 单 chunk 间最大间隔（思考模型可能较长时间不产出内容）
+/** 上游两次有效字节间最大间隔（深度思考模型可能长时间不产出 token） */
+const STREAM_CHUNK_TIMEOUT_MS = 180_000;
+/** 向客户端发送 SSE 注释心跳的间隔，防止代理/客户端因思考静默误判断线 */
+const STREAM_HEARTBEAT_MS = 15_000;
 
 function createGuardedStream(
   upstream: ReadableStream<Uint8Array>,
   controller: AbortController,
 ): ReadableStream<Uint8Array> {
   const reader = upstream.getReader();
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const encoder = new TextEncoder();
+  const heartbeatBytes = encoder.encode(': keepalive\n\n');
+  const timeoutBytes = encoder.encode(
+    'data: {"error":{"message":"流传输超时，连接已中断"}}\n\ndata: [DONE]\n\n',
+  );
 
-  const resetTimer = (ctrl: ReadableStreamDefaultController<Uint8Array>): void => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      // 流空闲超时 → 发送错误事件并关闭
-      const errorEvent = new TextEncoder().encode(
-        'data: {"error":{"message":"流传输超时，连接已中断"}}\n\ndata: [DONE]\n\n'
-      );
-      try {
-        ctrl.enqueue(errorEvent);
-      } catch {
-        // controller 可能已关闭
-      }
-      try { ctrl.close(); } catch { /* 可能已被 pull 关闭 */ }
-      controller.abort();
-      try { reader.releaseLock(); } catch { /* 可能已释放 */ }
-    }, STREAM_CHUNK_TIMEOUT_MS);
-  };
+  // 供 cancel() 与 start() 共享的清理句柄
+  let stopTimers: (() => void) | null = null;
+  /** 停止向下游写入（cancel / 超时 / 结束时置位） */
+  let stopped = false;
 
   return new ReadableStream({
-    start(ctrl) {
-      resetTimer(ctrl);
-    },
-    async pull(ctrl) {
-      try {
-        const { done, value } = await reader.read();
-        if (done) {
-          if (idleTimer) clearTimeout(idleTimer);
-          try { ctrl.close(); } catch { /* 可能已被超时回调关闭 */ }
-          return;
+    async start(ctrl) {
+      let lastUpstreamAt = Date.now();
+      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+      let idleTimer: ReturnType<typeof setInterval> | null = null;
+      let finished = false;
+
+      const cleanupTimers = (): void => {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
         }
-        resetTimer(ctrl);
-        ctrl.enqueue(value);
+        if (idleTimer) {
+          clearInterval(idleTimer);
+          idleTimer = null;
+        }
+      };
+      stopTimers = cleanupTimers;
+
+      const safeClose = (): void => {
+        if (finished) return;
+        finished = true;
+        stopped = true;
+        cleanupTimers();
+        try { ctrl.close(); } catch { /* already closed */ }
+        try { reader.releaseLock(); } catch { /* already released / still reading */ }
+      };
+
+      const safeEnqueue = (chunk: Uint8Array): boolean => {
+        if (stopped || finished) return false;
+        try {
+          ctrl.enqueue(chunk);
+          return true;
+        } catch {
+          safeClose();
+          return false;
+        }
+      };
+
+      // 心跳：思考阶段上游可能数十秒不发字节，仍要保持下行连接活跃
+      heartbeatTimer = setInterval(() => {
+        safeEnqueue(heartbeatBytes);
+      }, STREAM_HEARTBEAT_MS);
+
+      // 上游空闲监控（与心跳分离：心跳不重置上游活跃时间）
+      // 超时后 cancel reader，让下方 while 自然退出，避免在 read 进行中 releaseLock
+      idleTimer = setInterval(() => {
+        if (Date.now() - lastUpstreamAt < STREAM_CHUNK_TIMEOUT_MS) return;
+        cleanupTimers();
+        safeEnqueue(timeoutBytes);
+        stopped = true;
+        controller.abort();
+        void reader.cancel().catch(() => { /* ignore */ });
+      }, 1_000);
+
+      try {
+        while (!stopped) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          lastUpstreamAt = Date.now();
+          if (!safeEnqueue(value)) break;
+        }
       } catch {
-        if (idleTimer) clearTimeout(idleTimer);
-        try { ctrl.close(); } catch { /* 可能已被超时回调关闭 */ }
+        // 上游读取失败 / abort / cancel：尽力平静关闭
+      } finally {
+        safeClose();
       }
     },
     cancel() {
-      if (idleTimer) clearTimeout(idleTimer);
-      reader.releaseLock();
+      stopped = true;
+      stopTimers?.();
       controller.abort();
+      void reader.cancel().catch(() => { /* ignore */ });
     },
   });
 }

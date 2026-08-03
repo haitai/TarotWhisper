@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useMemo } from 'react';
+import { Fragment, useMemo, useState, type ReactElement, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import type { RetryState } from '@/lib/api/stream-client';
@@ -128,7 +128,7 @@ function renderWithGlyphs(
   text: string,
   cardRe: RegExp | null,
   positionRe: RegExp | null
-): React.ReactNode {
+): ReactNode {
   if (!cardRe && !positionRe) return text;
 
   // 先按牌名拆，再在未装饰片段按阵位名拆
@@ -172,10 +172,10 @@ function renderWithGlyphs(
 
 /** 递归遍历 ReactMarkdown 的 children，仅处理字符串叶节点 */
 function decorateChildren(
-  children: React.ReactNode,
+  children: ReactNode,
   cardRe: RegExp | null,
   positionRe: RegExp | null
-): React.ReactNode {
+): ReactNode {
   if (!cardRe && !positionRe) return children;
   if (typeof children === 'string') {
     return renderWithGlyphs(children, cardRe, positionRe);
@@ -398,6 +398,8 @@ export function InterpretationBody({
   const segments = parseInterpretationSegments(content);
   const { thinking, answer } = mergeSegments(segments);
   const showWaitingHint = streaming && !answer;
+  // 思考块默认折叠；折叠时不必把整段思考喂给 Markdown 解析器
+  const [thinkingOpen, setThinkingOpen] = useState(false);
 
   // 关键词正则 · useMemo 避免每个 paragraph 重建
   const cardRe     = useMemo(() => buildTermRegex(cardTerms ?? []),     [cardTerms]);
@@ -434,6 +436,11 @@ export function InterpretationBody({
     };
   }, [cardRe, positionRe]);
 
+  // 流式中的正文：超过一定长度时跳过关键词装饰，降低每帧开销
+  const answerComponents = streaming && answer.length > 4_000
+    ? MARKDOWN_COMPONENTS
+    : components;
+
   return (
     <div
       className={`interpretation-content ${
@@ -446,13 +453,28 @@ export function InterpretationBody({
     >
       {/* 思考块 · 统一折叠在顶部，不再切碎正文 */}
       {thinking && (
-        <details className="group ink-panel-quiet my-6">
+        <details
+          className="group ink-panel-quiet my-6"
+          open={thinkingOpen}
+          onToggle={(event) => {
+            setThinkingOpen((event.currentTarget as HTMLDetailsElement).open);
+          }}
+        >
           <summary className="flex items-center justify-between gap-4 px-6 py-5 cursor-pointer select-none [&::-webkit-details-marker]:hidden">
             <div className="flex items-center gap-4">
               <span className="text-gold-dim text-sm">◇</span>
               <div className="flex flex-col gap-1.5">
                 <span className="cn-label text-bone">
                   模 型 思 考
+                  {streaming && !answer ? (
+                    <span className="ml-3 cn-hint text-bone-faint normal-case tracking-normal">
+                      进行中 · {thinking.length.toLocaleString()} 字
+                    </span>
+                  ) : thinking.length > 200 ? (
+                    <span className="ml-3 cn-hint text-bone-faint normal-case tracking-normal">
+                      {thinking.length.toLocaleString()} 字
+                    </span>
+                  ) : null}
                 </span>
                 <span className="cn-hint text-bone-faint group-open:hidden">
                   点 击 展 开
@@ -470,11 +492,24 @@ export function InterpretationBody({
             </span>
           </summary>
 
-          <div className="px-6 pb-6 hairline-top pt-5">
-            <ReactMarkdown components={MARKDOWN_COMPONENTS}>
-              {thinking}
-            </ReactMarkdown>
-          </div>
+          {/*
+            关键时才挂载正文：
+            - 流式中用纯文本（避免对快速增长的思考反复跑 Markdown AST）
+            - 完成后才走 ReactMarkdown
+          */}
+          {thinkingOpen && (
+            <div className="px-6 pb-6 hairline-top pt-5">
+              {streaming ? (
+                <pre className="font-body text-bone-dim text-base leading-[1.9] whitespace-pre-wrap break-words font-light m-0">
+                  {thinking}
+                </pre>
+              ) : (
+                <ReactMarkdown components={MARKDOWN_COMPONENTS}>
+                  {thinking}
+                </ReactMarkdown>
+              )}
+            </div>
+          )}
         </details>
       )}
 
@@ -488,7 +523,7 @@ export function InterpretationBody({
 
       {/* 正文 · 连续渲染 */}
       {answer && (
-        <ReactMarkdown components={components}>
+        <ReactMarkdown components={answerComponents}>
           {answer}
         </ReactMarkdown>
       )}
@@ -504,7 +539,7 @@ export function InterpretationBody({
 }
 
 /** 金色仪式封印 · 解读完成的“盖印”动作 */
-function SigilSeal(): React.ReactElement {
+function SigilSeal(): ReactElement {
   // 上下左右四道小到许 · 表示四象限定
   const ticks = [0, 90, 180, 270];
   return (

@@ -14,6 +14,7 @@ import { getDefaultSpread } from '@/lib/tarot/spreads';
 import { saveReading, updateReadingFollowUps } from '@/lib/readingStorage';
 import { extractDecisionJson as extractDecisionJsonUtil } from '@/lib/tarot/sseUtils';
 import { streamInterpret, type RetryState } from '@/lib/api/stream-client';
+import { createStreamTextBuffer } from '@/lib/api/stream-buffer';
 import { LLMError, classifyError } from '@/lib/api/errors';
 import { genId } from '@/lib/id';
 
@@ -145,13 +146,15 @@ export function useReading() {
     setPhase('interpret');
 
     const controller = createAbortController();
+    // 节流 setState：长思考时 token 极密，逐 chunk setState 会卡死神谕阶段
+    const textBuffer = createStreamTextBuffer((text) => setInterpretation(text));
 
     try {
       const result = await streamInterpret(
         { question, spread, drawnCards, apiConfig },
         {
-          onContent: (chunk) => setInterpretation((prev) => prev + chunk),
-          onThinking: (chunk) => setInterpretation((prev) => prev + chunk),
+          onContent: (chunk) => textBuffer.append(chunk),
+          onThinking: (chunk) => textBuffer.append(chunk),
           onStreamError: (msg) => setError(msg),
           onRetry: (attempt, max) => {
             setRetryInfo({ attempt, max });
@@ -159,6 +162,12 @@ export function useReading() {
         },
         { signal: controller.signal },
       );
+
+      // 确保最后一帧完整刷到 UI（以服务端累积的 fullText 为准）
+      textBuffer.flush();
+      if (result.fullText) {
+        setInterpretation(result.fullText);
+      }
 
       if (result.usingFallback) {
         console.info('使用内置 LLM 配置（有速率限制）。配置自己的 API Key 可解除限制。');
@@ -184,6 +193,7 @@ export function useReading() {
         setError('未收到有效解读内容，连接可能被网关提前中断');
       }
     } catch (err) {
+      textBuffer.flush();
       // ABORTED 不算错误（用户主动取消）
       if (err instanceof LLMError && err.info.code === 'ABORTED') {
         // 用户取消，静默处理
@@ -191,6 +201,7 @@ export function useReading() {
       }
       setError(getErrorMessage(err));
     } finally {
+      textBuffer.dispose();
       setIsInterpreting(false);
       setRetryInfo(null);
       if (activeAbortRef.current === controller) {
@@ -212,6 +223,9 @@ export function useReading() {
     patchFollowUp(followUpId, { status: 'interpreting', interpretation: '', error: null });
 
     const controller = createAbortController();
+    const textBuffer = createStreamTextBuffer((text) => {
+      patchFollowUp(followUpId, { interpretation: text });
+    });
 
     try {
       const result = await streamInterpret(
@@ -228,14 +242,8 @@ export function useReading() {
           },
         },
         {
-          onContent: (chunk) =>
-            patchFollowUp(followUpId, (prev) => ({
-              interpretation: prev.interpretation + chunk,
-            })),
-          onThinking: (chunk) =>
-            patchFollowUp(followUpId, (prev) => ({
-              interpretation: prev.interpretation + chunk,
-            })),
+          onContent: (chunk) => textBuffer.append(chunk),
+          onThinking: (chunk) => textBuffer.append(chunk),
           onStreamError: (msg) =>
             patchFollowUp(followUpId, { error: msg }),
           onRetry: (attempt, max) =>
@@ -243,6 +251,11 @@ export function useReading() {
         },
         { signal: controller.signal },
       );
+
+      textBuffer.flush();
+      if (result.fullText) {
+        patchFollowUp(followUpId, { interpretation: result.fullText });
+      }
 
       if (!result.fullText && !result.receivedError) {
         patchFollowUp(followUpId, {
@@ -267,12 +280,14 @@ export function useReading() {
         }
       }
     } catch (err) {
+      textBuffer.flush();
       if (err instanceof LLMError && err.info.code === 'ABORTED') return;
       patchFollowUp(followUpId, {
         status: 'error',
         error: getErrorMessage(err),
       });
     } finally {
+      textBuffer.dispose();
       setFollowUpRetries((prev) => {
         if (!(followUpId in prev)) return prev;
         const next = { ...prev };
