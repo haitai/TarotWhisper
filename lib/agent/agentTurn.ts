@@ -76,6 +76,12 @@ export interface InterpretationRerunResult {
   truncated: boolean;
 }
 
+export interface FollowUpDecisionResult {
+  decision: 'direct' | 'draw';
+  drawCount: number;
+  reason: string;
+}
+
 // ─── 编排主函数 ─────────────────────────────────────────────
 
 export interface RunAgentTurnParams {
@@ -83,6 +89,20 @@ export interface RunAgentTurnParams {
   apiConfig: ApiConfig;
   signal: AbortSignal;
   callbacks: AgentTurnCallbacks;
+}
+
+/** 根据问题挑选合适牌阵（供流式回合与分步仪式复用） */
+export async function chooseSpreadForQuestion(
+  question: string,
+  apiConfig: ApiConfig,
+  signal: AbortSignal,
+): Promise<SpreadChosenEvent> {
+  const choice = await chooseSpread(question, apiConfig, signal);
+  if (signal.aborted) {
+    throw new LLMError({ code: 'ABORTED', message: '已取消请求', retryable: false });
+  }
+  const spread = getSpreadById(choice.spreadId)!;
+  return { spread, reason: choice.reason };
 }
 
 /**
@@ -102,9 +122,8 @@ export async function runAgentTurn(
   const { question, apiConfig, signal, callbacks } = params;
 
   // ── 阶段 1：选牌阵决策 ──
-  const choice = await chooseSpread(question, apiConfig, signal);
-  const spread = getSpreadById(choice.spreadId)!;
-  callbacks.onSpreadChosen?.({ spread, reason: choice.reason });
+  const { spread, reason } = await chooseSpreadForQuestion(question, apiConfig, signal);
+  callbacks.onSpreadChosen?.({ spread, reason });
 
   if (signal.aborted) {
     throw new LLMError({ code: 'ABORTED', message: '已取消请求', retryable: false });
@@ -130,7 +149,7 @@ export async function runAgentTurn(
 
   return {
     spread,
-    reason: choice.reason,
+    reason,
     drawnCards,
     interpretation: result.fullText,
     truncated: result.truncated,
@@ -226,6 +245,122 @@ export interface FollowUpTurnResult {
   truncated: boolean;
 }
 
+export interface DecideFollowUpParams {
+  originalQuestion: string;
+  spread: Spread;
+  drawnCards: DrawnCard[];
+  previousInterpretation: string;
+  followUpQuestion: string;
+  apiConfig: ApiConfig;
+  signal: AbortSignal;
+}
+
+/** 追问决策步：判断是否需要补牌（解析失败时默认直接回答） */
+export async function decideFollowUp(
+  params: DecideFollowUpParams,
+): Promise<FollowUpDecisionResult> {
+  const {
+    originalQuestion,
+    spread,
+    drawnCards,
+    previousInterpretation,
+    followUpQuestion,
+    apiConfig,
+    signal,
+  } = params;
+
+  const decidePrompt = buildFollowUpDecidePrompt(
+    originalQuestion,
+    spread,
+    drawnCards,
+    previousInterpretation,
+    followUpQuestion,
+  );
+
+  const decideResult = await streamRaw(decidePrompt, apiConfig, signal, { maxRetries: 1 });
+  const decision = extractDecisionJson(decideResult.fullText);
+
+  if (signal.aborted) {
+    throw new LLMError({ code: 'ABORTED', message: '已取消请求', retryable: false });
+  }
+
+  return {
+    decision: decision?.decision ?? 'direct',
+    drawCount: decision?.drawCount ?? 0,
+    reason: decision?.reason ?? '',
+  };
+}
+
+export interface StreamFollowUpInterpretationParams {
+  originalQuestion: string;
+  spread: Spread;
+  drawnCards: DrawnCard[];
+  previousInterpretation: string;
+  followUpQuestion: string;
+  decision: 'direct' | 'draw';
+  additionalCards: DrawnCard[];
+  apiConfig: ApiConfig;
+  signal: AbortSignal;
+  callbacks: FollowUpTurnCallbacks;
+}
+
+function buildFollowUpInterpretPrompt(params: {
+  originalQuestion: string;
+  spread: Spread;
+  drawnCards: DrawnCard[];
+  previousInterpretation: string;
+  followUpQuestion: string;
+  decision: 'direct' | 'draw';
+  additionalCards: DrawnCard[];
+}): string {
+  const {
+    originalQuestion,
+    spread,
+    drawnCards,
+    previousInterpretation,
+    followUpQuestion,
+    decision,
+    additionalCards,
+  } = params;
+
+  return decision === 'draw'
+    ? buildFollowUpWithExtrasPrompt(
+        originalQuestion,
+        spread,
+        drawnCards,
+        previousInterpretation,
+        followUpQuestion,
+        additionalCards,
+      )
+    : buildFollowUpDirectPrompt(
+        originalQuestion,
+        spread,
+        drawnCards,
+        previousInterpretation,
+        followUpQuestion,
+      );
+}
+
+/** 执行追问的流式解读步（直接回答或带补充牌解读） */
+export async function streamFollowUpInterpretation(
+  params: StreamFollowUpInterpretationParams,
+): Promise<InterpretationRerunResult> {
+  const { apiConfig, signal, callbacks, ...promptParams } = params;
+  const interpretPrompt = buildFollowUpInterpretPrompt(promptParams);
+
+  const result = await streamRaw(interpretPrompt, apiConfig, signal, {
+    onContent: callbacks.onContent,
+    onThinking: callbacks.onThinking,
+    onStreamError: callbacks.onStreamError,
+    onRetry: callbacks.onRetry,
+  });
+
+  return {
+    interpretation: result.fullText,
+    truncated: result.truncated,
+  };
+}
+
 export interface RunFollowUpTurnParams {
   originalQuestion: string;
   spread: Spread;
@@ -253,21 +388,15 @@ export async function runFollowUpTurn(
   } = params;
 
   // ── decide 步 ──
-  const decidePrompt = buildFollowUpDecidePrompt(
+  const { decision: decisionMode, drawCount, reason } = await decideFollowUp({
     originalQuestion,
     spread,
     drawnCards,
     previousInterpretation,
     followUpQuestion,
-  );
-
-  const decideResult = await streamRaw(decidePrompt, apiConfig, signal, { maxRetries: 1 });
-  const decision = extractDecisionJson(decideResult.fullText);
-
-  // 解析失败时默认直接回答，不中断
-  const decisionMode: 'direct' | 'draw' = decision?.decision ?? 'direct';
-  const drawCount = decision?.drawCount ?? 0;
-  const reason = decision?.reason ?? '';
+    apiConfig,
+    signal,
+  });
 
   callbacks.onDecided?.(decisionMode, drawCount, reason);
 
@@ -287,29 +416,17 @@ export async function runFollowUpTurn(
   }
 
   // ── interpret 步 ──
-  const interpretPrompt =
-    decisionMode === 'draw'
-      ? buildFollowUpWithExtrasPrompt(
-          originalQuestion,
-          spread,
-          drawnCards,
-          previousInterpretation,
-          followUpQuestion,
-          additionalCards,
-        )
-      : buildFollowUpDirectPrompt(
-          originalQuestion,
-          spread,
-          drawnCards,
-          previousInterpretation,
-          followUpQuestion,
-        );
-
-  const result = await streamRaw(interpretPrompt, apiConfig, signal, {
-    onContent: callbacks.onContent,
-    onThinking: callbacks.onThinking,
-    onStreamError: callbacks.onStreamError,
-    onRetry: callbacks.onRetry,
+  const result = await streamFollowUpInterpretation({
+    originalQuestion,
+    spread,
+    drawnCards,
+    previousInterpretation,
+    followUpQuestion,
+    decision: decisionMode,
+    additionalCards,
+    apiConfig,
+    signal,
+    callbacks,
   });
 
   return {
@@ -317,7 +434,7 @@ export async function runFollowUpTurn(
     drawCount,
     reason,
     additionalCards,
-    interpretation: result.fullText,
+    interpretation: result.interpretation,
     truncated: result.truncated,
   };
 }
@@ -341,36 +458,14 @@ export async function rerunFollowUpInterpretation(
   params: RerunFollowUpInterpretationParams,
 ): Promise<InterpretationRerunResult> {
   const {
-    originalQuestion,
-    spread,
-    drawnCards,
-    previousInterpretation,
-    followUpQuestion,
-    decision,
-    additionalCards,
     previousFollowUpInterpretation,
     apiConfig,
     signal,
     callbacks,
+    ...promptParams
   } = params;
 
-  const basePrompt =
-    decision === 'draw'
-      ? buildFollowUpWithExtrasPrompt(
-          originalQuestion,
-          spread,
-          drawnCards,
-          previousInterpretation,
-          followUpQuestion,
-          additionalCards,
-        )
-      : buildFollowUpDirectPrompt(
-          originalQuestion,
-          spread,
-          drawnCards,
-          previousInterpretation,
-          followUpQuestion,
-        );
+  const basePrompt = buildFollowUpInterpretPrompt(promptParams);
 
   const result = await streamRaw(
     appendRegenerationInstruction(basePrompt, previousFollowUpInterpretation),

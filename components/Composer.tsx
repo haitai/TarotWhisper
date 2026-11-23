@@ -31,8 +31,8 @@ const MODES: { value: DrawMode; label: string }[] = [
 ];
 
 const MODE_HINTS: Record<DrawMode, string> = {
-  oracle: '神谕会按你的问题挑一个牌阵、抽牌，再写下解读。',
-  self: '你来选牌阵、洗牌、一张张翻开，最后请神谕解读。',
+  oracle: '神谕为你挑选牌阵，由你亲手洗牌抽牌，翻开后自动解读。',
+  self: '你来选牌阵、亲手洗牌抽牌并逐张翻开，最后请神谕解读。',
 };
 
 function placeholderFor(intent: ComposerIntent, mode: DrawMode, isBusy: boolean): string {
@@ -102,7 +102,7 @@ export function Composer({
     </div>
   );
 
-  const submitLabel = intent === 'follow-up' ? '追问' : mode === 'self' ? '开始抽牌' : '请神谕解读';
+  const submitLabel = intent === 'follow-up' ? '追问' : mode === 'self' ? '开始抽牌' : '请神谕选阵';
 
   if (!isDock) {
     return (

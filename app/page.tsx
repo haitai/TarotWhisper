@@ -54,12 +54,15 @@ export default function OraclePage(): ReactElement {
     lastAgent?.status === 'running' ||
     Boolean(lastAgent?.followUps.some((fu) => fu.status === 'running'));
 
-  const intent: ComposerIntent =
-    lastAgent?.status === 'ritual'
-      ? 'blocked'
-      : lastAgent?.status === 'done' && lastAgent.spread && lastAgent.content
-        ? 'follow-up'
-        : 'new';
+  const hasPendingRitual =
+    lastAgent?.status === 'ritual' ||
+    Boolean(lastAgent?.followUps.some((fu) => fu.status === 'ritual'));
+
+  const intent: ComposerIntent = hasPendingRitual
+    ? 'blocked'
+    : lastAgent?.status === 'done' && lastAgent.spread && lastAgent.content
+      ? 'follow-up'
+      : 'new';
 
   // 亲手抽牌前几步不需要 API，解读时再提示配置
   const needsApi = intent === 'follow-up' || mode === 'oracle';
@@ -80,11 +83,18 @@ export default function OraclePage(): ReactElement {
     regenerateFollowUp: (agentId, followUpId) => chat.regenerateFollowUp(agentId, followUpId, config),
     chooseSpread: chat.chooseRitualSpread,
     backToSpreadChoice: chat.backToSpreadChoice,
-    shuffle: chat.shuffleAndDraw,
-    reveal: chat.revealCards,
+    completeDraw: chat.completeRitualDraw,
+    quickDraw: (agentId) => chat.quickDrawOracle(agentId, config),
+    reveal: (agentId, all) => chat.revealCards(agentId, all, canUseApi ? config : undefined),
     interpret: (agentId) => chat.interpretRitual(agentId, config),
     handOver: (agentId) => chat.handOverToOracle(agentId, config),
     discard: chat.discardRitual,
+    completeFollowUpDraw: chat.completeFollowUpDraw,
+    quickDrawFollowUp: (agentId, followUpId) => chat.quickDrawFollowUp(agentId, followUpId, config),
+    revealFollowUp: (agentId, followUpId, all) =>
+      chat.revealFollowUpCards(agentId, followUpId, all, canUseApi ? config : undefined),
+    interpretFollowUp: (agentId, followUpId) => chat.interpretFollowUp(agentId, followUpId, config),
+    discardFollowUp: chat.discardFollowUp,
     openSettings,
   };
 

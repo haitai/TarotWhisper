@@ -1,10 +1,29 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { saveChat, loadChat, clearChat } from '@/lib/agentChatStorage';
-import { drawCardsForSpread } from '@/lib/tarot/draw';
+import { drawCardsForSpread, drawSupplementaryCards } from '@/lib/tarot/draw';
 import { getSpreadById } from '@/lib/tarot/spreads';
-import type { ChatMessage, AgentMessage } from '@/hooks/useAgentChat';
+import type { ChatMessage, AgentMessage, FollowUpMessage } from '@/hooks/useAgentChat';
 
 const STORAGE_KEY = 'mystic-tarot-chat-v1';
+
+function makeFollowUp(overrides: Partial<FollowUpMessage> = {}): FollowUpMessage {
+  return {
+    id: 'f1',
+    question: '追问',
+    status: 'done',
+    ritualStage: null,
+    revealedCount: 0,
+    decision: 'direct',
+    drawCount: 0,
+    reason: '',
+    additionalCards: [],
+    interpretation: '追问回复',
+    error: null,
+    notice: null,
+    retry: null,
+    ...overrides,
+  };
+}
 
 function makeAgent(overrides: Partial<AgentMessage> = {}): AgentMessage {
   return {
@@ -132,19 +151,12 @@ describe('对话持久化', () => {
     saveChat([
       makeAgent({
         followUps: [
-          {
-            id: 'f1',
-            question: '追问',
+          makeFollowUp({
             status: 'running',
             decision: null,
-            drawCount: 0,
-            reason: '',
-            additionalCards: [],
             interpretation: '',
-            error: null,
-            notice: null,
             retry: { attempt: 1, max: 2 },
-          },
+          }),
         ],
       }),
     ]);
@@ -154,6 +166,114 @@ describe('对话持久化', () => {
     expect(restored.followUps[0].status).toBe('error');
     expect(restored.followUps[0].error).toContain('中断');
     expect(restored.followUps[0].retry).toBeNull();
+  });
+
+  it('神谕选好牌阵待用户抽牌的状态刷新后完整恢复', () => {
+    const spread = getSpreadById('three-card')!;
+    saveChat([
+      makeAgent({
+        mode: 'oracle',
+        status: 'ritual',
+        ritualStage: 'shuffle',
+        spread,
+        spreadReason: '为你展开三张牌阵',
+        content: '',
+        drawnCards: [],
+      }),
+    ]);
+
+    const [restored] = loadChat();
+    if (restored.role !== 'agent') throw new Error('expected agent message');
+    expect(restored.mode).toBe('oracle');
+    expect(restored.status).toBe('ritual');
+    expect(restored.ritualStage).toBe('shuffle');
+    expect(restored.spread?.id).toBe('three-card');
+    expect(restored.error).toBeNull();
+  });
+
+  it('追问补牌进行中的状态刷新后完整恢复并保留已翻开张数', () => {
+    const additionalCards = drawSupplementaryCards(2);
+    saveChat([
+      makeAgent({
+        followUps: [
+          makeFollowUp({
+            id: 'f-shuffle',
+            status: 'ritual',
+            ritualStage: 'shuffle',
+            decision: 'draw',
+            drawCount: 2,
+            additionalCards: [],
+            revealedCount: 0,
+            interpretation: '',
+          }),
+          makeFollowUp({
+            id: 'f-reveal',
+            status: 'ritual',
+            ritualStage: 'reveal',
+            decision: 'draw',
+            drawCount: 2,
+            additionalCards,
+            revealedCount: 1,
+            interpretation: '',
+          }),
+        ],
+      }),
+    ]);
+
+    const [restored] = loadChat();
+    if (restored.role !== 'agent') throw new Error('expected agent message');
+    expect(restored.followUps[0]).toMatchObject({
+      status: 'ritual',
+      ritualStage: 'shuffle',
+      revealedCount: 0,
+    });
+    expect(restored.followUps[1]).toMatchObject({
+      status: 'ritual',
+      ritualStage: 'reveal',
+      revealedCount: 1,
+    });
+  });
+
+  it('追问为 ritual 但缺少有效抽牌决策时安全降级为中断态', () => {
+    saveChat([
+      makeAgent({
+        followUps: [
+          makeFollowUp({
+            status: 'ritual',
+            ritualStage: 'shuffle',
+            decision: 'direct',
+            drawCount: 0,
+            interpretation: '',
+          }),
+        ],
+      }),
+    ]);
+
+    const [restored] = loadChat();
+    if (restored.role !== 'agent') throw new Error('expected agent message');
+    expect(restored.followUps[0].status).toBe('error');
+    expect(restored.followUps[0].ritualStage).toBeNull();
+    expect(restored.followUps[0].error).toContain('中断');
+  });
+
+  it('旧记录追问缺少 ritualStage 与 revealedCount 时补全默认值', () => {
+    const additionalCards = drawSupplementaryCards(2);
+    const legacyFollowUp: Record<string, unknown> = {
+      ...makeFollowUp({ additionalCards }),
+    };
+    delete legacyFollowUp.ritualStage;
+    delete legacyFollowUp.revealedCount;
+
+    const legacyAgent: Record<string, unknown> = {
+      ...makeAgent(),
+      followUps: [legacyFollowUp],
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify([legacyAgent]));
+
+    const [restored] = loadChat();
+    if (restored.role !== 'agent') throw new Error('expected agent message');
+    expect(restored.followUps[0].ritualStage).toBeNull();
+    expect(restored.followUps[0].revealedCount).toBe(2);
   });
 
   it('只保留最近的若干条消息', () => {

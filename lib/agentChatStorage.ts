@@ -9,7 +9,13 @@
  * 亲手抽牌（ritual）不涉及网络请求，原样恢复，用户可以接着翻牌。
  */
 
-import type { AgentMessage, ChatMessage, RitualStage } from '@/hooks/useAgentChat';
+import type {
+  AgentMessage,
+  ChatMessage,
+  FollowUpMessage,
+  FollowUpRitualStage,
+  RitualStage,
+} from '@/hooks/useAgentChat';
 
 const STORAGE_KEY = 'mystic-tarot-chat-v1';
 
@@ -38,6 +44,56 @@ function restoreRitualStage(msg: AgentMessage): RitualStage {
   return msg.ritualStage === 'spread' ? 'spread' : 'shuffle';
 }
 
+/** 追问补牌的步骤以已有数据为准 */
+function restoreFollowUpRitualStage(fu: FollowUpMessage): FollowUpRitualStage {
+  return Array.isArray(fu.additionalCards) && fu.additionalCards.length > 0
+    ? 'reveal'
+    : 'shuffle';
+}
+
+/** 补齐追问记录缺少的字段并处理中断状态 */
+function normalizeFollowUp(raw: FollowUpMessage): FollowUpMessage {
+  const additionalCards = Array.isArray(raw.additionalCards) ? raw.additionalCards : [];
+  const revealedCount = Number.isInteger(raw.revealedCount)
+    ? Math.min(Math.max(raw.revealedCount, 0), additionalCards.length)
+    : raw.status === 'done'
+      ? additionalCards.length
+      : 0;
+
+  const base: FollowUpMessage = {
+    ...raw,
+    additionalCards,
+    revealedCount,
+    ritualStage: null,
+    retry: null,
+  };
+
+  if (raw.status === 'running') {
+    return {
+      ...base,
+      status: 'error',
+      error: raw.interpretation ? null : INTERRUPTED_HINT,
+    };
+  }
+
+  if (raw.status === 'ritual') {
+    if (raw.decision === 'draw' && raw.drawCount > 0) {
+      return {
+        ...base,
+        status: 'ritual',
+        ritualStage: restoreFollowUpRitualStage(base),
+      };
+    }
+    return {
+      ...base,
+      status: 'error',
+      error: INTERRUPTED_HINT,
+    };
+  }
+
+  return base;
+}
+
 /** 补齐旧版本记录缺少的字段 */
 function withDefaults(msg: AgentMessage): AgentMessage {
   const isRitual = msg.status === 'ritual';
@@ -48,6 +104,7 @@ function withDefaults(msg: AgentMessage): AgentMessage {
     revealedCount: Number.isInteger(msg.revealedCount)
       ? Math.min(Math.max(msg.revealedCount, 0), msg.drawnCards.length)
       : 0,
+    followUps: msg.followUps.map(normalizeFollowUp),
   };
 }
 
@@ -57,12 +114,6 @@ function fromStored(messages: ChatMessage[]): ChatMessage[] {
     if (raw.role === 'user') return raw;
     const msg = withDefaults(raw);
 
-    const followUps = msg.followUps.map((fu) =>
-      fu.status === 'running'
-        ? { ...fu, status: 'error' as const, error: INTERRUPTED_HINT, retry: null }
-        : { ...fu, retry: null },
-    );
-
     // 首轮消息：生成中被打断且正文为空，说明还没产出内容
     if (msg.status === 'running') {
       return {
@@ -70,11 +121,10 @@ function fromStored(messages: ChatMessage[]): ChatMessage[] {
         status: 'error' as const,
         error: msg.content ? null : INTERRUPTED_HINT,
         retry: null,
-        followUps,
       };
     }
 
-    return { ...msg, retry: null, followUps };
+    return { ...msg, retry: null };
   });
 }
 

@@ -5,14 +5,14 @@
  *
  * 以「消息列表」为核心：用户消息 + Agent 消息（内嵌牌阵/牌面/解读）。
  * 一个 Agent 消息即一个完整回合，有两种选牌方式：
- * - 神谕选牌：选牌阵 → 抽牌 → 流式解读，全部自动完成；
- * - 亲手抽牌：用户选阵、洗牌、逐张翻牌（status = ritual），翻完再请神谕解读。
- * 追问作为后续 Agent 消息追加，复用 decide/draw 协议。
+ * - 神谕选牌（oracle）：神谕选牌阵 → 用户亲手洗牌/挑牌/翻牌（或「替我抽」快捷跳过）→ 翻完自动流式解读；
+ * - 亲手抽牌（self）：用户选阵、洗牌挑牌、逐张翻牌，翻完后点击请神谕解读。
+ * 追问作为后续 Agent 消息追加，需要补牌时同样支持亲手抽牌或快捷跳过。
  */
 
 import { useState, useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
-import { ApiConfig, DrawnCard, FollowUp, Reading, Spread } from '@/lib/tarot/types';
-import { drawCardsForSpread } from '@/lib/tarot/draw';
+import { ApiConfig, DrawnCard, FollowUp, Spread } from '@/lib/tarot/types';
+import { drawCardsForSpread, drawSupplementaryCards } from '@/lib/tarot/draw';
 import { loadChat, saveChat, clearChat } from '@/lib/agentChatStorage';
 import {
   saveReading,
@@ -20,10 +20,11 @@ import {
   updateReadingInterpretation,
 } from '@/lib/readingStorage';
 import {
+  chooseSpreadForQuestion,
+  decideFollowUp,
   rerunAgentInterpretation,
   rerunFollowUpInterpretation,
-  runAgentTurn,
-  runFollowUpTurn,
+  streamFollowUpInterpretation,
 } from '@/lib/agent/agentTurn';
 import { LLMError, classifyError } from '@/lib/api/errors';
 import type { RetryState } from '@/lib/api/stream-client';
@@ -34,14 +35,20 @@ import { genId } from '@/lib/id';
 /** 一次生成的状态 */
 export type TurnStatus = 'running' | 'done' | 'error';
 
-/** 首轮回合状态：ritual 表示亲手抽牌进行中，之后同样进入 running → done / error */
+/** 首轮回合状态：ritual 表示抽牌进行中，之后同样进入 running → done / error */
 export type AgentMessageStatus = 'ritual' | TurnStatus;
 
-/** 选牌方式：oracle = 神谕选阵并抽牌；self = 用户亲手选阵、洗牌、翻牌 */
+/** 选牌方式：oracle = 神谕选阵后用户抽牌（可替我抽）；self = 用户亲手选阵、洗牌、翻牌 */
 export type DrawMode = 'oracle' | 'self';
 
 /** 亲手抽牌的步骤 */
 export type RitualStage = 'spread' | 'shuffle' | 'reveal';
+
+/** 追问补牌的步骤 */
+export type FollowUpRitualStage = 'shuffle' | 'reveal';
+
+/** 追问消息状态 */
+export type FollowUpMessageStatus = 'ritual' | TurnStatus;
 
 /** 用户消息 */
 export interface UserMessage {
@@ -58,9 +65,9 @@ export interface AgentMessage {
   status: AgentMessageStatus;
   error: string | null;
   mode: DrawMode;
-  /** 亲手抽牌当前所在步骤；只在 status 为 ritual 时有值 */
+  /** 抽牌仪式当前所在步骤；只在 status 为 ritual 时有值 */
   ritualStage: RitualStage | null;
-  /** 亲手抽牌时按阵位顺序已翻开的张数 */
+  /** 按阵位顺序已翻开的张数 */
   revealedCount: number;
   /** 选定的牌阵与理由 */
   spread: Spread | null;
@@ -81,7 +88,11 @@ export interface AgentMessage {
 export interface FollowUpMessage {
   id: string;
   question: string;
-  status: TurnStatus;
+  status: FollowUpMessageStatus;
+  /** 追问补牌当前所在步骤；只在 status 为 ritual 时有值 */
+  ritualStage: FollowUpRitualStage | null;
+  /** 追问补牌已翻开的张数 */
+  revealedCount: number;
   decision: 'direct' | 'draw' | null;
   drawCount: number;
   reason: string;
@@ -126,6 +137,8 @@ function makeFollowUpMessage(question: string): FollowUpMessage {
     id: genId(),
     question,
     status: 'running',
+    ritualStage: null,
+    revealedCount: 0,
     decision: null,
     drawCount: 0,
     reason: '',
@@ -209,6 +222,27 @@ function findAgentMessage(agentId: string): AgentMessage | undefined {
   return found?.role === 'agent' ? found : undefined;
 }
 
+function findFollowUpMessage(
+  agentId: string,
+  followUpId: string,
+): { agent: AgentMessage; followUp: FollowUpMessage } | undefined {
+  const agent = findAgentMessage(agentId);
+  if (!agent) return undefined;
+  const followUp = agent.followUps.find((fu) => fu.id === followUpId);
+  return followUp ? { agent, followUp } : undefined;
+}
+
+function collectExcludedCardIds(agent: AgentMessage, excludeFollowUpId?: string): string[] {
+  const ids = agent.drawnCards.map((d) => d.card.id);
+  for (const fu of agent.followUps) {
+    if (fu.id === excludeFollowUpId) continue;
+    for (const d of fu.additionalCards) {
+      ids.push(d.card.id);
+    }
+  }
+  return ids;
+}
+
 // ─── Hook ───────────────────────────────────────────────────
 
 export function useAgentChat() {
@@ -254,17 +288,6 @@ export function useAgentChat() {
   }, [cancel]);
 
   // ── 局部更新工具 ───────────────────────────────────────
-  const patchLastAgent = useCallback(
-    (patch: Partial<AgentMessage> | ((prev: AgentMessage) => Partial<AgentMessage>)) => {
-      commit((prev) => {
-        const last = prev[prev.length - 1];
-        if (!last || last.role !== 'agent') return prev;
-        const p = typeof patch === 'function' ? patch(last) : patch;
-        return [...prev.slice(0, -1), { ...last, ...p }];
-      });
-    },
-    [commit],
-  );
 
   const patchAgent = useCallback(
     (
@@ -334,276 +357,100 @@ export function useAgentChat() {
 
   const persistFollowUpsForAgent = useCallback((agentId: string): void => {
     queueMicrotask(() => {
-      const agent = snapshot.messages.find(
-        (message) => message.role === 'agent' && message.id === agentId,
-      );
-      if (!agent || agent.role !== 'agent' || !agent.readingId) return;
+      const agent = findAgentMessage(agentId);
+      if (!agent || !agent.readingId) return;
       updateReadingFollowUps(agent.readingId, toStoredFollowUps(agent));
     });
   }, []);
 
-  // ── 发起首轮提问 ───────────────────────────────────────
+  // ── 共享流式执行工具 ───────────────────────────────────
 
-  const sendQuestion = useCallback(
-    async (question: string, apiConfig: ApiConfig): Promise<void> => {
-      const trimmed = question.trim();
-      if (!trimmed || isRunning) return;
-
-      const userMsg = makeUserMessage(trimmed);
-      const agentMsg = makeAgentMessage();
-      commit((prev) => [...prev, userMsg, agentMsg]);
-      setIsRunning(true);
-
-      const controller = createController();
-
-      try {
-        const result = await runAgentTurn({
-          question: trimmed,
-          apiConfig,
-          signal: controller.signal,
-          callbacks: {
-            onSpreadChosen: ({ spread, reason }) =>
-              patchLastAgent({ spread, spreadReason: reason }),
-            onCardsDrawn: ({ drawnCards }) => patchLastAgent({ drawnCards }),
-            onContent: (chunk) =>
-              patchLastAgent((prev) => ({ content: prev.content + chunk })),
-            onThinking: (chunk) =>
-              patchLastAgent((prev) => ({ content: prev.content + chunk })),
-            onStreamError: (msg) =>
-              patchLastAgent((prev) => ({ error: prev.error ?? msg })),
-            onRetry: (attempt, max) =>
-              patchLastAgent({ retry: { attempt, max } }),
-          },
-        });
-
-        // 持久化
-        const readingId = genId();
-        patchLastAgent({
-          status: 'done',
-          readingId,
-          retry: null,
-          notice: result.truncated
-            ? '解读内容因模型输出长度限制被截断，已显示部分内容。'
-            : null,
-        });
-
-        const reading: Reading = {
-          id: readingId,
-          question: trimmed,
-          spread: result.spread,
-          drawnCards: result.drawnCards,
-          interpretation: result.interpretation,
-          createdAt: new Date(),
-        };
-        saveReading(reading);
-      } catch (err) {
-        if (err instanceof LLMError && err.info.code === 'ABORTED') {
-          patchLastAgent({ status: 'error', error: '已停止生成', retry: null });
-          return;
-        }
-        patchLastAgent({ status: 'error', error: getErrorMessage(err), retry: null });
-      } finally {
-        setIsRunning(false);
-        if (activeAbortRef.current === controller) {
-          activeAbortRef.current = null;
-        }
-      }
-    },
-    [isRunning, createController, patchLastAgent, commit],
-  );
-
-  // ── 发起追问 ───────────────────────────────────────────
-
-  const askFollowUp = useCallback(
-    async (question: string, apiConfig: ApiConfig): Promise<void> => {
-      const trimmed = question.trim();
-      if (!trimmed || isRunning) return;
-
-      // 找到最后一个 agent 消息作为追问的上下文
-      const lastAgent = [...snapshot.messages].reverse().find((m) => m.role === 'agent');
-      if (
-        !lastAgent ||
-        lastAgent.role !== 'agent' ||
-        lastAgent.status !== 'done' ||
-        !lastAgent.spread ||
-        !lastAgent.content
-      ) {
-        return;
-      }
-
-      const followUp = makeFollowUpMessage(trimmed);
-      const targetAgentId = lastAgent.id;
-      const originalQuestion = findOriginalQuestion(targetAgentId);
-
-      commit((prev) => {
-        let changed = false;
-        const next = prev.map((message) => {
-          if (message.role !== 'agent' || message.id !== targetAgentId) {
-            return message;
-          }
-
-          changed = true;
-          return { ...message, followUps: [...message.followUps, followUp] };
-        });
-
-        return changed ? next : prev;
-      });
-
-      setIsRunning(true);
-      const controller = createController();
-
-      try {
-        const result = await runFollowUpTurn({
-          originalQuestion,
-          spread: lastAgent.spread,
-          drawnCards: lastAgent.drawnCards,
-          previousInterpretation: lastAgent.content,
-          followUpQuestion: trimmed,
-          apiConfig,
-          signal: controller.signal,
-          callbacks: {
-            onDecided: (decision, drawCount, reason) =>
-              patchFollowUp(followUp.id, { decision, drawCount, reason }),
-            onSupplementaryCards: (cards) =>
-              patchFollowUp(followUp.id, { additionalCards: cards }),
-            onContent: (chunk) =>
-              patchFollowUp(followUp.id, (prev) => ({
-                interpretation: prev.interpretation + chunk,
-              })),
-            onThinking: (chunk) =>
-              patchFollowUp(followUp.id, (prev) => ({
-                interpretation: prev.interpretation + chunk,
-              })),
-            onStreamError: (msg) =>
-              patchFollowUp(followUp.id, (prev) => ({ error: prev.error ?? msg })),
-            onRetry: (attempt, max) =>
-              patchFollowUp(followUp.id, { retry: { attempt, max } }),
-          },
-        });
-
-        patchFollowUp(followUp.id, {
-          status: 'done',
-          retry: null,
-          notice: result.truncated ? '回复因输出长度限制被截断。' : null,
-        });
-
-        // 持久化追问
-        if (lastAgent.readingId) {
-          persistFollowUpsForAgent(targetAgentId);
-        }
-      } catch (err) {
-        if (err instanceof LLMError && err.info.code === 'ABORTED') {
-          patchFollowUp(followUp.id, { status: 'error', error: '已停止生成', retry: null });
-          return;
-        }
-        patchFollowUp(followUp.id, { status: 'error', error: getErrorMessage(err), retry: null });
-      } finally {
-        setIsRunning(false);
-        if (activeAbortRef.current === controller) {
-          activeAbortRef.current = null;
-        }
-      }
-    },
-    [
-      isRunning,
-      createController,
-      patchFollowUp,
-      commit,
-      findOriginalQuestion,
-      persistFollowUpsForAgent,
-    ],
-  );
-
-  // ── 重新生成首轮回复 ─────────────────────────────────────
-
-  const regenerateAgentMessage = useCallback(
-    async (agentId: string, apiConfig: ApiConfig): Promise<void> => {
-      if (isRunning) return;
-
-      const target = snapshot.messages.find(
-        (message) => message.role === 'agent' && message.id === agentId,
-      );
-      if (!target || target.role !== 'agent') return;
-
-      const originalQuestion = findOriginalQuestion(agentId);
-      if (!originalQuestion) return;
-
-      const previousContent = target.content;
-      const existingReadingId = target.readingId;
-      const canReuseReading = Boolean(target.spread && target.drawnCards.length > 0);
-
+  const runSpreadChoiceStep = useCallback(
+    async (agentId: string, question: string, apiConfig: ApiConfig): Promise<void> => {
       patchAgent(agentId, {
-        content: '',
+        mode: 'oracle',
         status: 'running',
+        ritualStage: null,
+        spread: null,
+        spreadReason: '',
+        drawnCards: [],
+        revealedCount: 0,
+        content: '',
         error: null,
         notice: null,
         retry: null,
-        ...(canReuseReading ? {} : {
-          spread: null,
-          spreadReason: '',
-          drawnCards: [],
-          readingId: null,
-        }),
+        readingId: null,
       });
       setIsRunning(true);
-
       const controller = createController();
 
       try {
-        if (target.spread && target.drawnCards.length > 0) {
-          const result = await rerunAgentInterpretation({
-            question: originalQuestion,
-            spread: target.spread,
-            drawnCards: target.drawnCards,
-            previousInterpretation: previousContent,
-            apiConfig,
-            signal: controller.signal,
-            callbacks: {
-              onContent: (chunk) =>
-                patchAgent(agentId, (prev) => ({ content: prev.content + chunk })),
-              onThinking: (chunk) =>
-                patchAgent(agentId, (prev) => ({ content: prev.content + chunk })),
-              onStreamError: (msg) =>
-                patchAgent(agentId, (prev) => ({ error: prev.error ?? msg })),
-              onRetry: (attempt, max) =>
-                patchAgent(agentId, { retry: { attempt, max } }),
-            },
-          });
-
-          if (existingReadingId) {
-            updateReadingInterpretation(existingReadingId, result.interpretation);
-            patchAgent(agentId, {
-              status: 'done',
-              notice: result.truncated ? '回复因输出长度限制被截断。' : null,
-            });
-          } else {
-            const readingId = genId();
-            const reading: Reading = {
-              id: readingId,
-              question: originalQuestion,
-              spread: target.spread,
-              drawnCards: target.drawnCards,
-              interpretation: result.interpretation,
-              createdAt: new Date(),
-            };
-            saveReading(reading);
-            patchAgent(agentId, {
-              status: 'done',
-              readingId,
-              notice: result.truncated ? '回复因输出长度限制被截断。' : null,
-            });
-          }
+        const { spread, reason } = await chooseSpreadForQuestion(
+          question,
+          apiConfig,
+          controller.signal,
+        );
+        patchAgent(agentId, {
+          spread,
+          spreadReason: reason,
+          status: 'ritual',
+          ritualStage: 'shuffle',
+          retry: null,
+        });
+      } catch (err) {
+        if (err instanceof LLMError && err.info.code === 'ABORTED') {
+          patchAgent(agentId, { status: 'error', error: '已停止生成', retry: null });
           return;
         }
+        patchAgent(agentId, { status: 'error', error: getErrorMessage(err), retry: null });
+      } finally {
+        setIsRunning(false);
+        if (activeAbortRef.current === controller) {
+          activeAbortRef.current = null;
+        }
+      }
+    },
+    [createController, patchAgent],
+  );
 
-        const result = await runAgentTurn({
-          question: originalQuestion,
+  const runAgentInterpretationStream = useCallback(
+    async (
+      agentId: string,
+      question: string,
+      spread: Spread,
+      drawnCards: DrawnCard[],
+      apiConfig: ApiConfig,
+      options?: {
+        previousInterpretation?: string;
+        existingReadingId?: string | null;
+        revealedCount?: number;
+        extraInitialPatch?: Partial<AgentMessage>;
+      },
+    ): Promise<void> => {
+      patchAgent(agentId, {
+        status: 'running',
+        ritualStage: null,
+        content: '',
+        error: null,
+        notice: null,
+        retry: null,
+        ...options?.extraInitialPatch,
+        ...(options?.revealedCount !== undefined
+          ? { revealedCount: options.revealedCount }
+          : {}),
+      });
+      setIsRunning(true);
+      const controller = createController();
+
+      try {
+        const result = await rerunAgentInterpretation({
+          question,
+          spread,
+          drawnCards,
+          previousInterpretation: options?.previousInterpretation,
           apiConfig,
           signal: controller.signal,
           callbacks: {
-            onSpreadChosen: ({ spread, reason }) =>
-              patchAgent(agentId, { spread, spreadReason: reason }),
-            onCardsDrawn: ({ drawnCards }) => patchAgent(agentId, { drawnCards }),
             onContent: (chunk) =>
               patchAgent(agentId, (prev) => ({ content: prev.content + chunk })),
             onThinking: (chunk) =>
@@ -615,23 +462,25 @@ export function useAgentChat() {
           },
         });
 
-        const readingId = genId();
-        const reading: Reading = {
-          id: readingId,
-          question: originalQuestion,
-          spread: result.spread,
-          drawnCards: result.drawnCards,
-          interpretation: result.interpretation,
-          createdAt: new Date(),
-        };
-        saveReading(reading);
-        patchAgent(agentId, {
-          status: 'done',
-          readingId,
-          notice: result.truncated
-            ? '解读内容因模型输出长度限制被截断，已显示部分内容。'
-            : null,
-        });
+        const notice = result.truncated
+          ? '解读内容因模型输出长度限制被截断，已显示部分内容。'
+          : null;
+
+        if (options?.existingReadingId) {
+          updateReadingInterpretation(options.existingReadingId, result.interpretation);
+          patchAgent(agentId, { status: 'done', notice });
+        } else {
+          const readingId = genId();
+          saveReading({
+            id: readingId,
+            question,
+            spread,
+            drawnCards,
+            interpretation: result.interpretation,
+            createdAt: new Date(),
+          });
+          patchAgent(agentId, { status: 'done', readingId, notice });
+        }
       } catch (err) {
         if (err instanceof LLMError && err.info.code === 'ABORTED') {
           patchAgent(agentId, { status: 'error', error: '已停止生成' });
@@ -646,103 +495,161 @@ export function useAgentChat() {
         }
       }
     },
-    [isRunning, createController, findOriginalQuestion, patchAgent],
+    [createController, patchAgent],
   );
 
-  // ── 重新生成追问回复 ─────────────────────────────────────
-
-  const regenerateFollowUp = useCallback(
-    async (agentId: string, followUpId: string, apiConfig: ApiConfig): Promise<void> => {
-      if (isRunning) return;
-
-      const agent = snapshot.messages.find(
-        (message) => message.role === 'agent' && message.id === agentId,
-      );
-      if (
-        !agent ||
-        agent.role !== 'agent' ||
-        !agent.spread ||
-        !agent.content
-      ) {
-        return;
-      }
-
-      const followUp = agent.followUps.find((fu) => fu.id === followUpId);
+  const runFollowUpInterpretationStream = useCallback(
+    async (
+      agentId: string,
+      followUpId: string,
+      apiConfig: ApiConfig,
+      options?: {
+        isRegenerate?: boolean;
+        revealedCount?: number;
+        extraInitialPatch?: Partial<FollowUpMessage>;
+      },
+    ): Promise<void> => {
+      const found = findFollowUpMessage(agentId, followUpId);
       const originalQuestion = findOriginalQuestion(agentId);
-      if (!followUp || !originalQuestion) return;
+      if (!found || !originalQuestion) return;
 
+      const { agent, followUp } = found;
+      if (!agent.spread || !agent.content) return;
+      const spread = agent.spread;
+      const previousInterpretation = agent.content;
+      const decision = followUp.decision ?? 'direct';
+      const additionalCards =
+        options?.extraInitialPatch?.additionalCards ?? followUp.additionalCards;
       const previousFollowUpInterpretation = followUp.interpretation;
-      const canReuseDecision =
-        followUp.decision !== null &&
-        (followUp.decision === 'direct' || followUp.additionalCards.length > 0);
 
       patchFollowUp(followUpId, {
         status: 'running',
+        ritualStage: null,
         error: null,
         notice: null,
         retry: null,
         interpretation: '',
-        ...(canReuseDecision ? {} : {
-          decision: null,
-          drawCount: 0,
-          reason: '',
-          additionalCards: [],
-        }),
+        ...options?.extraInitialPatch,
+        ...(options?.revealedCount !== undefined
+          ? { revealedCount: options.revealedCount }
+          : {}),
       });
       setIsRunning(true);
-
       const controller = createController();
 
       try {
-        if (canReuseDecision && followUp.decision) {
-          const result = await rerunFollowUpInterpretation({
-            originalQuestion,
-            spread: agent.spread,
-            drawnCards: agent.drawnCards,
-            previousInterpretation: agent.content,
-            followUpQuestion: followUp.question,
-            decision: followUp.decision,
-            additionalCards: followUp.additionalCards,
-            previousFollowUpInterpretation,
-            apiConfig,
-            signal: controller.signal,
-            callbacks: {
-              onContent: (chunk) =>
-                patchFollowUp(followUpId, (prev) => ({
-                  interpretation: prev.interpretation + chunk,
-                })),
-              onThinking: (chunk) =>
-                patchFollowUp(followUpId, (prev) => ({
-                  interpretation: prev.interpretation + chunk,
-                })),
-              onStreamError: (msg) =>
-                patchFollowUp(followUpId, (prev) => ({ error: prev.error ?? msg })),
-              onRetry: (attempt, max) =>
-                patchFollowUp(followUpId, { retry: { attempt, max } }),
-            },
-          });
+        const streamCallbacks = {
+          onContent: (chunk: string) =>
+            patchFollowUp(followUpId, (prev) => ({
+              interpretation: prev.interpretation + chunk,
+            })),
+          onThinking: (chunk: string) =>
+            patchFollowUp(followUpId, (prev) => ({
+              interpretation: prev.interpretation + chunk,
+            })),
+          onStreamError: (msg: string) =>
+            patchFollowUp(followUpId, (prev) => ({ error: prev.error ?? msg })),
+          onRetry: (attempt: number, max: number) =>
+            patchFollowUp(followUpId, { retry: { attempt, max } }),
+        };
 
-          patchFollowUp(followUpId, {
-            status: 'done',
-            notice: result.truncated ? '回复因输出长度限制被截断。' : null,
-          });
-          persistFollowUpsForAgent(agentId);
+        const result = options?.isRegenerate
+          ? await rerunFollowUpInterpretation({
+              originalQuestion,
+              spread,
+              drawnCards: agent.drawnCards,
+              previousInterpretation,
+              followUpQuestion: followUp.question,
+              decision,
+              additionalCards,
+              previousFollowUpInterpretation,
+              apiConfig,
+              signal: controller.signal,
+              callbacks: streamCallbacks,
+            })
+          : await streamFollowUpInterpretation({
+              originalQuestion,
+              spread,
+              drawnCards: agent.drawnCards,
+              previousInterpretation,
+              followUpQuestion: followUp.question,
+              decision,
+              additionalCards,
+              apiConfig,
+              signal: controller.signal,
+              callbacks: streamCallbacks,
+            });
+
+        patchFollowUp(followUpId, {
+          status: 'done',
+          notice: result.truncated ? '回复因输出长度限制被截断。' : null,
+        });
+        persistFollowUpsForAgent(agentId);
+      } catch (err) {
+        if (err instanceof LLMError && err.info.code === 'ABORTED') {
+          patchFollowUp(followUpId, { status: 'error', error: '已停止生成' });
           return;
         }
+        patchFollowUp(followUpId, { status: 'error', error: getErrorMessage(err) });
+      } finally {
+        patchFollowUp(followUpId, { retry: null });
+        setIsRunning(false);
+        if (activeAbortRef.current === controller) {
+          activeAbortRef.current = null;
+        }
+      }
+    },
+    [createController, findOriginalQuestion, patchFollowUp, persistFollowUpsForAgent],
+  );
 
-        const result = await runFollowUpTurn({
+  const runFollowUpDecideAndMaybeStream = useCallback(
+    async (
+      agentId: string,
+      followUpId: string,
+      followUpQuestion: string,
+      apiConfig: ApiConfig,
+    ): Promise<void> => {
+      const agent = findAgentMessage(agentId);
+      const originalQuestion = findOriginalQuestion(agentId);
+      if (!agent || !agent.spread || !agent.content || !originalQuestion) return;
+
+      setIsRunning(true);
+      const controller = createController();
+
+      try {
+        const { decision, drawCount, reason } = await decideFollowUp({
           originalQuestion,
           spread: agent.spread,
           drawnCards: agent.drawnCards,
           previousInterpretation: agent.content,
-          followUpQuestion: followUp.question,
+          followUpQuestion,
+          apiConfig,
+          signal: controller.signal,
+        });
+
+        patchFollowUp(followUpId, { decision, drawCount, reason });
+
+        if (decision === 'draw' && drawCount > 0) {
+          patchFollowUp(followUpId, {
+            status: 'ritual',
+            ritualStage: 'shuffle',
+            revealedCount: 0,
+            retry: null,
+          });
+          return;
+        }
+
+        const result = await streamFollowUpInterpretation({
+          originalQuestion,
+          spread: agent.spread,
+          drawnCards: agent.drawnCards,
+          previousInterpretation: agent.content,
+          followUpQuestion,
+          decision,
+          additionalCards: [],
           apiConfig,
           signal: controller.signal,
           callbacks: {
-            onDecided: (decision, drawCount, reason) =>
-              patchFollowUp(followUpId, { decision, drawCount, reason }),
-            onSupplementaryCards: (cards) =>
-              patchFollowUp(followUpId, { additionalCards: cards }),
             onContent: (chunk) =>
               patchFollowUp(followUpId, (prev) => ({
                 interpretation: prev.interpretation + chunk,
@@ -777,16 +684,176 @@ export function useAgentChat() {
         }
       }
     },
+    [createController, findOriginalQuestion, patchFollowUp, persistFollowUpsForAgent],
+  );
+
+  // ── 发起首轮提问（神谕选阵后交由用户抽牌） ──────────────
+
+  const sendQuestion = useCallback(
+    async (question: string, apiConfig: ApiConfig): Promise<void> => {
+      const trimmed = question.trim();
+      if (!trimmed || isRunning) return;
+
+      const userMsg = makeUserMessage(trimmed);
+      const agentMsg = makeAgentMessage('oracle');
+      commit((prev) => [...prev, userMsg, agentMsg]);
+
+      await runSpreadChoiceStep(agentMsg.id, trimmed, apiConfig);
+    },
+    [isRunning, commit, runSpreadChoiceStep],
+  );
+
+  // ── 发起追问 ───────────────────────────────────────────
+
+  const askFollowUp = useCallback(
+    async (question: string, apiConfig: ApiConfig): Promise<void> => {
+      const trimmed = question.trim();
+      if (!trimmed || isRunning) return;
+
+      // 找到最后一个 agent 消息作为追问的上下文
+      const lastAgent = [...snapshot.messages].reverse().find((m) => m.role === 'agent');
+      if (
+        !lastAgent ||
+        lastAgent.role !== 'agent' ||
+        lastAgent.status !== 'done' ||
+        !lastAgent.spread ||
+        !lastAgent.content ||
+        lastAgent.followUps.some((fu) => fu.status === 'ritual' || fu.status === 'running')
+      ) {
+        return;
+      }
+
+      const followUp = makeFollowUpMessage(trimmed);
+      const targetAgentId = lastAgent.id;
+
+      commit((prev) => {
+        let changed = false;
+        const next = prev.map((message) => {
+          if (message.role !== 'agent' || message.id !== targetAgentId) {
+            return message;
+          }
+
+          changed = true;
+          return { ...message, followUps: [...message.followUps, followUp] };
+        });
+
+        return changed ? next : prev;
+      });
+
+      await runFollowUpDecideAndMaybeStream(targetAgentId, followUp.id, trimmed, apiConfig);
+    },
+    [isRunning, commit, runFollowUpDecideAndMaybeStream],
+  );
+
+  // ── 重新生成首轮回复 ─────────────────────────────────────
+
+  const regenerateAgentMessage = useCallback(
+    async (agentId: string, apiConfig: ApiConfig): Promise<void> => {
+      if (isRunning) return;
+
+      const target = findAgentMessage(agentId);
+      if (!target) return;
+
+      const originalQuestion = findOriginalQuestion(agentId);
+      if (!originalQuestion) return;
+
+      if (target.spread && target.drawnCards.length > 0) {
+        await runAgentInterpretationStream(
+          agentId,
+          originalQuestion,
+          target.spread,
+          target.drawnCards,
+          apiConfig,
+          {
+            previousInterpretation: target.content,
+            existingReadingId: target.readingId,
+          },
+        );
+        return;
+      }
+
+      if (target.spread) {
+        patchAgent(agentId, {
+          status: 'ritual',
+          ritualStage: 'shuffle',
+          error: null,
+          notice: null,
+          retry: null,
+        });
+        return;
+      }
+
+      await runSpreadChoiceStep(agentId, originalQuestion, apiConfig);
+    },
+    [isRunning, findOriginalQuestion, patchAgent, runAgentInterpretationStream, runSpreadChoiceStep],
+  );
+
+  // ── 重新生成追问回复 ─────────────────────────────────────
+
+  const regenerateFollowUp = useCallback(
+    async (agentId: string, followUpId: string, apiConfig: ApiConfig): Promise<void> => {
+      if (isRunning) return;
+
+      const found = findFollowUpMessage(agentId, followUpId);
+      const originalQuestion = findOriginalQuestion(agentId);
+      if (!found || !found.agent.spread || !found.agent.content || !originalQuestion) {
+        return;
+      }
+
+      const { followUp } = found;
+      const canReuseDecision =
+        followUp.decision !== null &&
+        (followUp.decision === 'direct' || followUp.additionalCards.length > 0);
+
+      if (canReuseDecision) {
+        await runFollowUpInterpretationStream(agentId, followUpId, apiConfig, {
+          isRegenerate: true,
+        });
+        return;
+      }
+
+      if (
+        followUp.decision === 'draw' &&
+        followUp.drawCount > 0 &&
+        followUp.additionalCards.length === 0
+      ) {
+        patchFollowUp(followUpId, {
+          status: 'ritual',
+          ritualStage: 'shuffle',
+          revealedCount: 0,
+          error: null,
+          notice: null,
+          retry: null,
+        });
+        return;
+      }
+
+      patchFollowUp(followUpId, {
+        status: 'running',
+        ritualStage: null,
+        revealedCount: 0,
+        error: null,
+        notice: null,
+        retry: null,
+        interpretation: '',
+        decision: null,
+        drawCount: 0,
+        reason: '',
+        additionalCards: [],
+      });
+
+      await runFollowUpDecideAndMaybeStream(agentId, followUpId, followUp.question, apiConfig);
+    },
     [
       isRunning,
-      createController,
       findOriginalQuestion,
       patchFollowUp,
-      persistFollowUpsForAgent,
+      runFollowUpInterpretationStream,
+      runFollowUpDecideAndMaybeStream,
     ],
   );
 
-  // ── 亲手抽牌 ───────────────────────────────────────────
+  // ── 首轮抽牌仪式（self 与 oracle 共用） ──────────────────
 
   /** 记下问题并开始亲手抽牌；选阵、洗牌、翻牌都不需要 API */
   const startRitual = useCallback(
@@ -816,26 +883,16 @@ export function useAgentChat() {
     [patchAgent],
   );
 
-  const shuffleAndDraw = useCallback(
-    (agentId: string): void => {
+  /** 用户洗牌并挑牌完成后，落入阵位等待翻牌 */
+  const completeRitualDraw = useCallback(
+    (agentId: string, drawnCards: DrawnCard[]): void => {
       const target = findAgentMessage(agentId);
       if (!target || target.status !== 'ritual' || !target.spread) return;
+      if (drawnCards.length !== target.spread.positions.length) return;
       patchAgent(agentId, {
-        drawnCards: drawCardsForSpread(target.spread),
+        drawnCards,
         revealedCount: 0,
         ritualStage: 'reveal',
-      });
-    },
-    [patchAgent],
-  );
-
-  /** 按阵位顺序翻开下一张；all 为 true 时全部翻开 */
-  const revealCards = useCallback(
-    (agentId: string, all = false): void => {
-      patchAgent(agentId, (prev) => {
-        if (prev.status !== 'ritual' || prev.ritualStage !== 'reveal') return {};
-        const total = prev.drawnCards.length;
-        return { revealedCount: all ? total : Math.min(total, prev.revealedCount + 1) };
       });
     },
     [patchAgent],
@@ -860,83 +917,79 @@ export function useAgentChat() {
       const question = findOriginalQuestion(agentId);
       if (!question) return;
 
-      const { spread, drawnCards } = target;
-      patchAgent(agentId, {
-        status: 'running',
-        ritualStage: null,
-        content: '',
-        error: null,
-        notice: null,
-        retry: null,
-      });
-      setIsRunning(true);
-
-      const controller = createController();
-
-      try {
-        // 没有上一版时，这就是一次普通的解读
-        const result = await rerunAgentInterpretation({
-          question,
-          spread,
-          drawnCards,
-          apiConfig,
-          signal: controller.signal,
-          callbacks: {
-            onContent: (chunk) =>
-              patchAgent(agentId, (prev) => ({ content: prev.content + chunk })),
-            onThinking: (chunk) =>
-              patchAgent(agentId, (prev) => ({ content: prev.content + chunk })),
-            onStreamError: (msg) =>
-              patchAgent(agentId, (prev) => ({ error: prev.error ?? msg })),
-            onRetry: (attempt, max) =>
-              patchAgent(agentId, { retry: { attempt, max } }),
-          },
-        });
-
-        const readingId = genId();
-        saveReading({
-          id: readingId,
-          question,
-          spread,
-          drawnCards,
-          interpretation: result.interpretation,
-          createdAt: new Date(),
-        });
-        patchAgent(agentId, {
-          status: 'done',
-          readingId,
-          retry: null,
-          notice: result.truncated
-            ? '解读内容因模型输出长度限制被截断，已显示部分内容。'
-            : null,
-        });
-      } catch (err) {
-        if (err instanceof LLMError && err.info.code === 'ABORTED') {
-          patchAgent(agentId, { status: 'error', error: '已停止生成', retry: null });
-          return;
-        }
-        patchAgent(agentId, { status: 'error', error: getErrorMessage(err), retry: null });
-      } finally {
-        setIsRunning(false);
-        if (activeAbortRef.current === controller) {
-          activeAbortRef.current = null;
-        }
-      }
+      await runAgentInterpretationStream(
+        agentId,
+        question,
+        target.spread,
+        target.drawnCards,
+        apiConfig,
+      );
     },
-    [isRunning, createController, findOriginalQuestion, patchAgent],
+    [isRunning, findOriginalQuestion, runAgentInterpretationStream],
   );
 
-  /** 还没抽牌时改主意：改由神谕选阵、抽牌并解读 */
+  /** 神谕模式快捷跳过：替用户抽牌并直接开始流式解读 */
+  const quickDrawOracle = useCallback(
+    async (agentId: string, apiConfig: ApiConfig): Promise<void> => {
+      if (isRunning) return;
+
+      const target = findAgentMessage(agentId);
+      if (
+        !target ||
+        target.status !== 'ritual' ||
+        !target.spread ||
+        target.drawnCards.length > 0
+      ) {
+        return;
+      }
+
+      const question = findOriginalQuestion(agentId);
+      if (!question) return;
+
+      const drawnCards = drawCardsForSpread(target.spread);
+      await runAgentInterpretationStream(
+        agentId,
+        question,
+        target.spread,
+        drawnCards,
+        apiConfig,
+        {
+          revealedCount: 0,
+          extraInitialPatch: { drawnCards },
+        },
+      );
+    },
+    [isRunning, findOriginalQuestion, runAgentInterpretationStream],
+  );
+
+  /** 按阵位顺序翻开下一张；all 为 true 时全部翻开；神谕模式翻完最后一张自动开始解读 */
+  const revealCards = useCallback(
+    (agentId: string, all = false, autoInterpretConfig?: ApiConfig): void => {
+      const target = findAgentMessage(agentId);
+      if (!target || target.status !== 'ritual' || target.ritualStage !== 'reveal') return;
+      const total = target.drawnCards.length;
+      const nextCount = all ? total : Math.min(total, target.revealedCount + 1);
+      patchAgent(agentId, { revealedCount: nextCount });
+
+      if (target.mode === 'oracle' && nextCount >= total && autoInterpretConfig) {
+        void interpretRitual(agentId, autoInterpretConfig);
+      }
+    },
+    [patchAgent, interpretRitual],
+  );
+
+  /** 还没抽牌时改主意：由神谕挑选牌阵，再停下来由用户亲手抽牌 */
   const handOverToOracle = useCallback(
     async (agentId: string, apiConfig: ApiConfig): Promise<void> => {
       const target = findAgentMessage(agentId);
       if (isRunning || !target || target.status !== 'ritual' || target.drawnCards.length > 0) {
         return;
       }
-      patchAgent(agentId, { mode: 'oracle', ritualStage: null, spread: null });
-      await regenerateAgentMessage(agentId, apiConfig);
+      const question = findOriginalQuestion(agentId);
+      if (!question) return;
+      await runSpreadChoiceStep(agentId, question, apiConfig);
     },
-    [isRunning, patchAgent, regenerateAgentMessage],
+    [isRunning, findOriginalQuestion, runSpreadChoiceStep],
   );
 
   /** 放弃这次亲手抽牌，连同它的问题一起移除 */
@@ -949,6 +1002,113 @@ export function useAgentChat() {
         const start = prev[index - 1]?.role === 'user' ? index - 1 : index;
         return [...prev.slice(0, start), ...prev.slice(index + 1)];
       });
+    },
+    [commit],
+  );
+
+  // ── 追问补牌仪式 ───────────────────────────────────────
+
+  const completeFollowUpDraw = useCallback(
+    (agentId: string, followUpId: string, cards: DrawnCard[]): void => {
+      const found = findFollowUpMessage(agentId, followUpId);
+      if (!found) return;
+      const { followUp } = found;
+      if (
+        followUp.status !== 'ritual' ||
+        followUp.decision !== 'draw' ||
+        cards.length !== followUp.drawCount
+      ) {
+        return;
+      }
+      patchFollowUp(followUpId, {
+        additionalCards: cards,
+        revealedCount: 0,
+        ritualStage: 'reveal',
+      });
+    },
+    [patchFollowUp],
+  );
+
+  const interpretFollowUp = useCallback(
+    async (agentId: string, followUpId: string, apiConfig: ApiConfig): Promise<void> => {
+      if (isRunning) return;
+      const found = findFollowUpMessage(agentId, followUpId);
+      if (!found) return;
+      const { followUp } = found;
+      if (
+        followUp.status !== 'ritual' ||
+        followUp.additionalCards.length === 0 ||
+        followUp.revealedCount < followUp.additionalCards.length
+      ) {
+        return;
+      }
+      await runFollowUpInterpretationStream(agentId, followUpId, apiConfig, {
+        isRegenerate: false,
+      });
+    },
+    [isRunning, runFollowUpInterpretationStream],
+  );
+
+  const quickDrawFollowUp = useCallback(
+    async (agentId: string, followUpId: string, apiConfig: ApiConfig): Promise<void> => {
+      if (isRunning) return;
+      const found = findFollowUpMessage(agentId, followUpId);
+      if (!found) return;
+      const { agent, followUp } = found;
+      if (
+        followUp.status !== 'ritual' ||
+        followUp.decision !== 'draw' ||
+        followUp.drawCount <= 0 ||
+        followUp.additionalCards.length > 0
+      ) {
+        return;
+      }
+      const excludeCardIds = collectExcludedCardIds(agent, followUpId);
+      const additionalCards = drawSupplementaryCards(followUp.drawCount, 0, excludeCardIds);
+      await runFollowUpInterpretationStream(agentId, followUpId, apiConfig, {
+        isRegenerate: false,
+        revealedCount: 0,
+        extraInitialPatch: { additionalCards },
+      });
+    },
+    [isRunning, runFollowUpInterpretationStream],
+  );
+
+  const revealFollowUpCards = useCallback(
+    (
+      agentId: string,
+      followUpId: string,
+      all = false,
+      autoInterpretConfig?: ApiConfig,
+    ): void => {
+      const found = findFollowUpMessage(agentId, followUpId);
+      if (!found) return;
+      const { followUp } = found;
+      if (followUp.status !== 'ritual' || followUp.ritualStage !== 'reveal') return;
+      const total = followUp.additionalCards.length;
+      const nextCount = all ? total : Math.min(total, followUp.revealedCount + 1);
+      patchFollowUp(followUpId, { revealedCount: nextCount });
+
+      if (nextCount >= total && autoInterpretConfig) {
+        void interpretFollowUp(agentId, followUpId, autoInterpretConfig);
+      }
+    },
+    [patchFollowUp, interpretFollowUp],
+  );
+
+  const discardFollowUp = useCallback(
+    (agentId: string, followUpId: string): void => {
+      commit((prev) =>
+        prev.map((msg) => {
+          if (msg.role !== 'agent' || msg.id !== agentId) return msg;
+          const target = msg.followUps.find((fu) => fu.id === followUpId);
+          if (!target || target.status !== 'ritual') return msg;
+          return {
+            ...msg,
+            followUps: msg.followUps.filter((fu) => fu.id !== followUpId),
+          };
+        }),
+      );
     },
     [commit],
   );
@@ -973,11 +1133,17 @@ export function useAgentChat() {
     startRitual,
     chooseRitualSpread,
     backToSpreadChoice,
-    shuffleAndDraw,
+    completeRitualDraw,
+    quickDrawOracle,
     revealCards,
     interpretRitual,
     handOverToOracle,
     discardRitual,
+    completeFollowUpDraw,
+    quickDrawFollowUp,
+    revealFollowUpCards,
+    interpretFollowUp,
+    discardFollowUp,
     cancel,
     reset,
   };
