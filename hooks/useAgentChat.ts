@@ -883,21 +883,6 @@ export function useAgentChat() {
     [patchAgent],
   );
 
-  /** 用户洗牌并挑牌完成后，落入阵位等待翻牌 */
-  const completeRitualDraw = useCallback(
-    (agentId: string, drawnCards: DrawnCard[]): void => {
-      const target = findAgentMessage(agentId);
-      if (!target || target.status !== 'ritual' || !target.spread) return;
-      if (drawnCards.length !== target.spread.positions.length) return;
-      patchAgent(agentId, {
-        drawnCards,
-        revealedCount: 0,
-        ritualStage: 'reveal',
-      });
-    },
-    [patchAgent],
-  );
-
   /** 牌全部翻开后请神谕解读，完成后存入手札 */
   const interpretRitual = useCallback(
     async (agentId: string, apiConfig: ApiConfig): Promise<void> => {
@@ -926,6 +911,25 @@ export function useAgentChat() {
       );
     },
     [isRunning, findOriginalQuestion, runAgentInterpretationStream],
+  );
+
+  /** 用户洗牌并挑牌完成后落入阵位（牌已在槽中显形）；神谕模式自动开始解读 */
+  const completeRitualDraw = useCallback(
+    (agentId: string, drawnCards: DrawnCard[], autoInterpretConfig?: ApiConfig): void => {
+      const target = findAgentMessage(agentId);
+      if (!target || target.status !== 'ritual' || !target.spread) return;
+      if (drawnCards.length !== target.spread.positions.length) return;
+      patchAgent(agentId, {
+        drawnCards,
+        revealedCount: drawnCards.length,
+        ritualStage: 'reveal',
+      });
+
+      if (target.mode === 'oracle' && autoInterpretConfig) {
+        void interpretRitual(agentId, autoInterpretConfig);
+      }
+    },
+    [patchAgent, interpretRitual],
   );
 
   /** 神谕模式快捷跳过：替用户抽牌并直接开始流式解读 */
@@ -1008,27 +1012,6 @@ export function useAgentChat() {
 
   // ── 追问补牌仪式 ───────────────────────────────────────
 
-  const completeFollowUpDraw = useCallback(
-    (agentId: string, followUpId: string, cards: DrawnCard[]): void => {
-      const found = findFollowUpMessage(agentId, followUpId);
-      if (!found) return;
-      const { followUp } = found;
-      if (
-        followUp.status !== 'ritual' ||
-        followUp.decision !== 'draw' ||
-        cards.length !== followUp.drawCount
-      ) {
-        return;
-      }
-      patchFollowUp(followUpId, {
-        additionalCards: cards,
-        revealedCount: 0,
-        ritualStage: 'reveal',
-      });
-    },
-    [patchFollowUp],
-  );
-
   const interpretFollowUp = useCallback(
     async (agentId: string, followUpId: string, apiConfig: ApiConfig): Promise<void> => {
       if (isRunning) return;
@@ -1047,6 +1030,36 @@ export function useAgentChat() {
       });
     },
     [isRunning, runFollowUpInterpretationStream],
+  );
+
+  const completeFollowUpDraw = useCallback(
+    (
+      agentId: string,
+      followUpId: string,
+      cards: DrawnCard[],
+      autoInterpretConfig?: ApiConfig,
+    ): void => {
+      const found = findFollowUpMessage(agentId, followUpId);
+      if (!found) return;
+      const { followUp } = found;
+      if (
+        followUp.status !== 'ritual' ||
+        followUp.decision !== 'draw' ||
+        cards.length !== followUp.drawCount
+      ) {
+        return;
+      }
+      patchFollowUp(followUpId, {
+        additionalCards: cards,
+        revealedCount: cards.length,
+        ritualStage: 'reveal',
+      });
+
+      if (autoInterpretConfig) {
+        void interpretFollowUp(agentId, followUpId, autoInterpretConfig);
+      }
+    },
+    [patchFollowUp, interpretFollowUp],
   );
 
   const quickDrawFollowUp = useCallback(

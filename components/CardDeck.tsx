@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactElement } from 'react';
 
+import { CardPlate } from '@/components/CardPlate';
 import { CardMedallion } from '@/components/TarotCard';
 import { createFanPool, shuffle, type DrawnCandidate } from '@/lib/tarot/draw';
 import type { DrawnCard, SpreadPosition } from '@/lib/tarot/types';
@@ -20,9 +21,10 @@ type DeckPhase = 'idle' | 'shuffling' | 'picking';
 
 const DECK_SIZE = 5;
 const SHUFFLE_MS = 1500;
-const PICK_COMPLETE_MS = 260;
+const PICK_COMPLETE_MS = 750;
 const COPIES = [0, 1, 2] as const;
 const DRAG_THRESHOLD_PX = 6;
+const SETTLE_MOVE_PX = 8;
 const NUDGE_STEP_PX = 260;
 
 function buildDrawnCards(
@@ -60,6 +62,7 @@ export function CardDeck({
   const copy1StartRef = useRef<HTMLButtonElement | null>(null);
   const cycleWidthRef = useRef(0);
   const suppressClickRef = useRef(false);
+  const settledAnchorRef = useRef<{ x: number; y: number } | null>(null);
   const dragRef = useRef({
     active: false,
     dragging: false,
@@ -73,6 +76,11 @@ export function CardDeck({
       window.clearTimeout(shuffleTimer.current);
       window.clearTimeout(completeTimer.current);
     };
+  }, []);
+
+  const clearSettled = useCallback((): void => {
+    settledAnchorRef.current = null;
+    scrollRef.current?.classList.remove('deck-ribbon-settled');
   }, []);
 
   const wrapScroll = useCallback((el: HTMLDivElement): void => {
@@ -123,6 +131,7 @@ export function CardDeck({
       if (e.ctrlKey) return;
       if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && e.deltaY !== 0) {
         e.preventDefault();
+        clearSettled();
         el.scrollLeft += e.deltaY;
         wrapScroll(el);
       }
@@ -134,12 +143,13 @@ export function CardDeck({
       window.removeEventListener('resize', handleResize);
       el.removeEventListener('wheel', handleWheel);
     };
-  }, [phase, pool.length, wrapScroll]);
+  }, [phase, pool.length, wrapScroll, clearSettled]);
 
   const startShuffle = (): void => {
     if (disabled || phase === 'shuffling') return;
     window.clearTimeout(shuffleTimer.current);
     window.clearTimeout(completeTimer.current);
+    clearSettled();
 
     setPickedIndices([]);
     setPhase('shuffling');
@@ -168,6 +178,7 @@ export function CardDeck({
 
   const handleAutoFinish = (): void => {
     if (disabled || phase !== 'picking' || pickedIndices.length >= positions.length) return;
+    clearSettled();
 
     const pickedSet = new Set(pickedIndices);
     const remaining = pool.map((_, i) => i).filter((i) => !pickedSet.has(i));
@@ -196,6 +207,14 @@ export function CardDeck({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>): void => {
+    const anchor = settledAnchorRef.current;
+    if (anchor && e.pointerType === 'mouse') {
+      const dist = Math.hypot(e.clientX - anchor.x, e.clientY - anchor.y);
+      if (dist > SETTLE_MOVE_PX) {
+        clearSettled();
+      }
+    }
+
     const drag = dragRef.current;
     const el = scrollRef.current;
     if (!drag.active || !el || e.pointerId !== drag.pointerId) return;
@@ -203,6 +222,7 @@ export function CardDeck({
     const dx = e.clientX - drag.startX;
     if (!drag.dragging) {
       if (Math.abs(dx) <= DRAG_THRESHOLD_PX) return;
+      clearSettled();
       drag.dragging = true;
       suppressClickRef.current = true;
       el.classList.add('deck-ribbon-dragging');
@@ -233,6 +253,7 @@ export function CardDeck({
   };
 
   const nudgeRibbon = (direction: -1 | 1): void => {
+    clearSettled();
     const el = scrollRef.current;
     if (!el) return;
     el.scrollBy({ left: direction * NUDGE_STEP_PX, behavior: 'smooth' });
@@ -246,12 +267,22 @@ export function CardDeck({
 
     let guideText: string;
     if (isDone) {
-      guideText = '已选好，正在摆牌…';
+      guideText = '牌都抽好了…';
     } else if (total === 1) {
       guideText = '凭直觉挑一张牌';
     } else {
       guideText = `为「${currentPos.nameCn}」挑一张牌（${pickedCount + 1} / ${total}）`;
     }
+
+    const slotWidthClass = compact
+      ? 'w-[3.75rem]'
+      : total > 5
+        ? 'w-[3.3rem]'
+        : 'w-[4.5rem]';
+    const slotListClass =
+      total > 5
+        ? 'mt-4 grid grid-cols-5 justify-items-center gap-x-2 gap-y-2.5 sm:gap-x-3'
+        : 'mt-4 flex flex-wrap items-start justify-center gap-x-3 gap-y-3';
 
     const cardSizeClass = compact
       ? 'h-[6.6rem] w-[4rem]'
@@ -266,31 +297,73 @@ export function CardDeck({
           {guideText}
         </p>
 
-        {total > 1 && (
-          <ol
-            className="mt-3 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-xs"
-            aria-label="选牌阵位进度"
-          >
-            {positions.map((pos, idx) => {
-              const isPickedPos = idx < pickedCount;
-              const isCurrentPos = idx === pickedCount;
-              return (
-                <li
-                  key={pos.id}
-                  className={
-                    isCurrentPos
+        <ol className={slotListClass} aria-label="抽牌槽位">
+          {positions.map((pos, idx) => {
+            const poolIndex = pickedIndices[idx];
+            const candidate = poolIndex !== undefined ? pool[poolIndex] : undefined;
+            const isCurrent = idx === pickedCount;
+
+            return (
+              <li
+                key={pos.id}
+                className={`flex flex-col items-center gap-1.5 ${slotWidthClass}`}
+              >
+                <span
+                  className={`w-full truncate text-center text-[11px] leading-tight ${
+                    isCurrent
                       ? 'font-semibold text-accent'
-                      : isPickedPos
+                      : candidate
                         ? 'text-ink'
                         : 'text-ink-muted'
-                  }
+                  }`}
                 >
-                  {isPickedPos ? `✓ ${pos.nameCn}` : pos.nameCn}
-                </li>
-              );
-            })}
-          </ol>
-        )}
+                  {pos.nameCn}
+                </span>
+
+                {candidate ? (
+                  <div className="slot-card-reveal w-full">
+                    <CardPlate
+                      card={candidate.card}
+                      isReversed={candidate.isReversed}
+                      sizes="80px"
+                      decorative
+                      className="w-full"
+                    />
+                  </div>
+                ) : (
+                  <div
+                    className={`grid aspect-[3/5] w-full place-items-center rounded-[5px] border border-dashed text-xs transition-colors ${
+                      isCurrent
+                        ? 'border-accent bg-accent-soft/35 font-semibold text-accent'
+                        : 'border-line-strong/80 bg-sunken/40 text-ink-muted'
+                    }`}
+                  >
+                    {idx + 1}
+                  </div>
+                )}
+
+                <span className="min-h-[2.25rem] w-full text-center leading-tight" aria-live="polite">
+                  {candidate ? (
+                    <span className="anim-fade block">
+                      <span className="block truncate text-[12px] font-semibold text-ink">
+                        {candidate.card.nameCn}
+                      </span>
+                      <span
+                        className={`block text-[11px] ${
+                          candidate.isReversed ? 'text-accent' : 'text-ink-muted'
+                        }`}
+                      >
+                        {candidate.isReversed ? '逆位' : '正位'}
+                      </span>
+                    </span>
+                  ) : isCurrent ? (
+                    <span className="block text-[11px] text-accent">待抽取</span>
+                  ) : null}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
 
         <div className="relative mt-2 w-full">
           <button
@@ -312,6 +385,7 @@ export function CardDeck({
             onPointerMove={handlePointerMove}
             onPointerUp={endDrag}
             onPointerCancel={endDrag}
+            onPointerLeave={clearSettled}
             className="deck-ribbon relative z-0 w-full cursor-grab overflow-x-auto pt-10 pb-6"
           >
             <div className="flex w-max items-end px-8">
@@ -340,10 +414,14 @@ export function CardDeck({
                             : undefined
                       }
                       type="button"
-                      onClick={() => {
+                      onClick={(e) => {
                         if (suppressClickRef.current) {
                           suppressClickRef.current = false;
                           return;
+                        }
+                        if (e.detail > 0) {
+                          settledAnchorRef.current = { x: e.clientX, y: e.clientY };
+                          scrollRef.current?.classList.add('deck-ribbon-settled');
                         }
                         handlePick(index);
                       }}

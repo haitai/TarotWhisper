@@ -83,13 +83,15 @@ export default function OraclePage(): ReactElement {
     regenerateFollowUp: (agentId, followUpId) => chat.regenerateFollowUp(agentId, followUpId, config),
     chooseSpread: chat.chooseRitualSpread,
     backToSpreadChoice: chat.backToSpreadChoice,
-    completeDraw: chat.completeRitualDraw,
+    completeDraw: (agentId, cards) =>
+      chat.completeRitualDraw(agentId, cards, canUseApi ? config : undefined),
     quickDraw: (agentId) => chat.quickDrawOracle(agentId, config),
     reveal: (agentId, all) => chat.revealCards(agentId, all, canUseApi ? config : undefined),
     interpret: (agentId) => chat.interpretRitual(agentId, config),
     handOver: (agentId) => chat.handOverToOracle(agentId, config),
     discard: chat.discardRitual,
-    completeFollowUpDraw: chat.completeFollowUpDraw,
+    completeFollowUpDraw: (agentId, followUpId, cards) =>
+      chat.completeFollowUpDraw(agentId, followUpId, cards, canUseApi ? config : undefined),
     quickDrawFollowUp: (agentId, followUpId) => chat.quickDrawFollowUp(agentId, followUpId, config),
     revealFollowUp: (agentId, followUpId, all) =>
       chat.revealFollowUpCards(agentId, followUpId, all, canUseApi ? config : undefined),

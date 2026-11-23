@@ -884,7 +884,7 @@
       opacity 240ms var(--ease-out),
       box-shadow 220ms var(--ease-out);
   }
-  .fan-card:hover:not(:disabled),
+  .deck-ribbon:not(.deck-ribbon-settled):not(.deck-ribbon-dragging) .fan-card:hover:not(:disabled),
   .fan-card:focus-visible:not(:disabled) {
     z-index: 300;
     transform: translateY(calc(var(--fan-y, 0px) - 18px)) rotate(var(--fan-angle, 0deg)) scale(1.04);
@@ -893,9 +893,12 @@
       0 14px 26px -14px rgb(60 42 24 / 0.78);
   }
   .fan-card.is-picked {
-    transform: translateY(calc(var(--fan-y, 0px) - 34px)) rotate(var(--fan-angle, 0deg)) scale(1.04);
-    opacity: 0;
+    z-index: 320;
     pointer-events: none;
+    animation: card-pick-out 340ms var(--ease-out) forwards;
+  }
+  .slot-card-reveal {
+    animation: slot-reveal 480ms var(--ease-out) both;
   }
 
   /* ─── 凯尔特十字 ─── */
@@ -988,6 +991,38 @@
   65%      { transform: translate(8%, 2%) rotate(2deg); }
 }
 
+@keyframes card-pick-out {
+  0% {
+    opacity: 1;
+    transform: translateY(calc(var(--fan-y, 0px) - 18px)) rotate(var(--fan-angle, 0deg)) scale(1.05);
+    box-shadow:
+      inset 0 0 0 2px var(--accent),
+      0 16px 28px -12px rgb(60 42 24 / 0.75);
+  }
+  28% {
+    opacity: 1;
+    transform: translateY(calc(var(--fan-y, 0px) - 22px)) rotate(var(--fan-angle, 0deg)) scale(1.06);
+    box-shadow:
+      inset 0 0 0 2px var(--accent),
+      0 18px 30px -12px rgb(60 42 24 / 0.7);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(calc(var(--fan-y, 0px) - 42px)) rotate(var(--fan-angle, 0deg)) scale(1.04);
+  }
+}
+
+@keyframes slot-reveal {
+  from {
+    opacity: 0;
+    transform: perspective(900px) translateY(10px) rotateY(90deg) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: perspective(900px) translateY(0) rotateY(0deg) scale(1);
+  }
+}
+
 @layer utilities {
   .anim-rise  { animation: rise 520ms var(--ease-out) both; }
   .anim-fade  { animation: fade 400ms var(--ease-out) both; }
@@ -1002,7 +1037,7 @@
     .plate { box-shadow: 0 0 0 1px color-mix(in oklab, var(--ink) 14%, transparent), 0 10px 22px -16px rgb(0 0 0 / 0.9); }
     .card-front { box-shadow: 0 0 0 1px color-mix(in oklab, var(--ink) 14%, transparent), 0 12px 24px -18px rgb(0 0 0 / 0.95); }
     .card-back { box-shadow: inset 0 0 0 1px var(--line-strong), 0 10px 22px -16px rgb(0 0 0 / 0.9); }
-    .fan-card:hover:not(:disabled),
+    .deck-ribbon:not(.deck-ribbon-settled):not(.deck-ribbon-dragging) .fan-card:hover:not(:disabled),
     .fan-card:focus-visible:not(:disabled) {
       box-shadow: inset 0 0 0 1px var(--accent), 0 14px 26px -14px rgb(0 0 0 / 0.95);
     }
@@ -1016,6 +1051,8 @@
   .letter-reveal > *,
   .card-sheen.is-active::before,
   .is-shuffling .deck-card,
+  .fan-card.is-picked,
+  .slot-card-reveal,
   .mention-card:hover .mention-preview,
   .mention-card:focus .mention-preview {
     animation: none !important;
@@ -1027,5 +1064,6 @@
   }
   .card-flipper { transition-duration: 1ms; }
   .fan-card { transition: none; }
+  .fan-card.is-picked { opacity: 0; }
   .card-tilt { transform: none !important; }
 }

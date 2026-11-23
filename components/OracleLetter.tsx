@@ -53,8 +53,8 @@ function useStaggeredReveal(total: number): number {
   return Math.min(count, total);
 }
 
-const RITUAL_STEPS = ['选牌阵', '洗牌挑牌', '翻牌', '解读'];
-const STEP_NUMERALS = ['一', '二', '三', '四'];
+const RITUAL_STEPS = ['选牌阵', '洗牌抽牌', '解读'];
+const STEP_NUMERALS = ['一', '二', '三'];
 const STAGE_INDEX: Record<RitualStage, number> = { spread: 0, shuffle: 1, reveal: 2 };
 
 function RitualSteps({ current }: { current: number }): ReactElement {
@@ -130,7 +130,7 @@ export function OracleLetter({ message, isBusy, canUseApi, actions }: OracleLett
           {isRevealRitual && (
             <p className="mb-5 text-center text-sm text-ink-soft">
               {allRevealed
-                ? '牌都翻开了。'
+                ? '牌阵已排好。'
                 : `按阵位顺序翻开，还剩 ${drawnCards.length - message.revealedCount} 张。`}
             </p>
           )}
