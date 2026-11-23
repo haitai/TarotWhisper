@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, type CSSProperties, type ReactElement } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactElement } from 'react';
 
 import { CardMedallion } from '@/components/TarotCard';
 import { createFanPool, shuffle, type DrawnCandidate } from '@/lib/tarot/draw';
@@ -21,6 +21,9 @@ type DeckPhase = 'idle' | 'shuffling' | 'picking';
 const DECK_SIZE = 5;
 const SHUFFLE_MS = 1500;
 const PICK_COMPLETE_MS = 260;
+const COPIES = [0, 1, 2] as const;
+const DRAG_THRESHOLD_PX = 6;
+const NUDGE_STEP_PX = 260;
 
 function buildDrawnCards(
   pool: readonly DrawnCandidate[],
@@ -53,6 +56,17 @@ export function CardDeck({
   const shuffleTimer = useRef(0);
   const completeTimer = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const copy0StartRef = useRef<HTMLButtonElement | null>(null);
+  const copy1StartRef = useRef<HTMLButtonElement | null>(null);
+  const cycleWidthRef = useRef(0);
+  const suppressClickRef = useRef(false);
+  const dragRef = useRef({
+    active: false,
+    dragging: false,
+    pointerId: -1,
+    startX: 0,
+    startScrollLeft: 0,
+  });
 
   useEffect(() => {
     return () => {
@@ -61,12 +75,66 @@ export function CardDeck({
     };
   }, []);
 
+  const wrapScroll = useCallback((el: HTMLDivElement): void => {
+    const cycleWidth = cycleWidthRef.current;
+    if (cycleWidth <= 0 || el.scrollWidth <= el.clientWidth + 4) return;
+
+    const low = cycleWidth * 0.5;
+    const high = Math.max(
+      low + cycleWidth,
+      Math.min(cycleWidth * 2, el.scrollWidth - el.clientWidth - 16),
+    );
+    const left = el.scrollLeft;
+
+    if (left < low) {
+      el.scrollLeft = left + cycleWidth;
+      if (dragRef.current.active) {
+        dragRef.current.startScrollLeft += cycleWidth;
+      }
+    } else if (left >= high) {
+      el.scrollLeft = left - cycleWidth;
+      if (dragRef.current.active) {
+        dragRef.current.startScrollLeft -= cycleWidth;
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (phase !== 'picking') return;
     const el = scrollRef.current;
     if (!el) return;
-    el.scrollLeft = Math.max(0, (el.scrollWidth - el.clientWidth) / 2);
-  }, [phase, pool.length]);
+
+    const measureAndCenter = (shouldCenter: boolean): void => {
+      const start0 = copy0StartRef.current;
+      const start1 = copy1StartRef.current;
+      if (!start0 || !start1) return;
+      const cycleWidth = start1.offsetLeft - start0.offsetLeft;
+      if (cycleWidth <= 0) return;
+      cycleWidthRef.current = cycleWidth;
+      if (shouldCenter) {
+        el.scrollLeft = cycleWidth + Math.max(0, (cycleWidth - el.clientWidth) / 2);
+      }
+    };
+
+    measureAndCenter(true);
+
+    const handleResize = (): void => measureAndCenter(false);
+    const handleWheel = (e: WheelEvent): void => {
+      if (e.ctrlKey) return;
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && e.deltaY !== 0) {
+        e.preventDefault();
+        el.scrollLeft += e.deltaY;
+        wrapScroll(el);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      el.removeEventListener('wheel', handleWheel);
+    };
+  }, [phase, pool.length, wrapScroll]);
 
   const startShuffle = (): void => {
     if (disabled || phase === 'shuffling') return;
@@ -77,8 +145,7 @@ export function CardDeck({
     setPhase('shuffling');
 
     shuffleTimer.current = window.setTimeout(() => {
-      const fanSize = compact ? Math.max(12, positions.length + 6) : 22;
-      setPool(createFanPool(fanSize, excludeCardIds));
+      setPool(createFanPool(undefined, excludeCardIds));
       setPhase('picking');
     }, SHUFFLE_MS);
   };
@@ -115,6 +182,62 @@ export function CardDeck({
     }, PICK_COMPLETE_MS);
   };
 
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>): void => {
+    if (e.pointerType !== 'mouse' || e.button !== 0 || disabled) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    dragRef.current = {
+      active: true,
+      dragging: false,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startScrollLeft: el.scrollLeft,
+    };
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>): void => {
+    const drag = dragRef.current;
+    const el = scrollRef.current;
+    if (!drag.active || !el || e.pointerId !== drag.pointerId) return;
+
+    const dx = e.clientX - drag.startX;
+    if (!drag.dragging) {
+      if (Math.abs(dx) <= DRAG_THRESHOLD_PX) return;
+      drag.dragging = true;
+      suppressClickRef.current = true;
+      el.classList.add('deck-ribbon-dragging');
+      el.setPointerCapture?.(e.pointerId);
+    }
+
+    el.scrollLeft = drag.startScrollLeft - dx;
+    wrapScroll(el);
+  };
+
+  const endDrag = (e: React.PointerEvent<HTMLDivElement>): void => {
+    const drag = dragRef.current;
+    const el = scrollRef.current;
+    if (!drag.active || !el || e.pointerId !== drag.pointerId) return;
+
+    const wasDragging = drag.dragging;
+    drag.active = false;
+    drag.dragging = false;
+    el.classList.remove('deck-ribbon-dragging');
+    if (el.hasPointerCapture?.(e.pointerId)) {
+      el.releasePointerCapture(e.pointerId);
+    }
+    if (wasDragging) {
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
+    }
+  };
+
+  const nudgeRibbon = (direction: -1 | 1): void => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollBy({ left: direction * NUDGE_STEP_PX, behavior: 'smooth' });
+  };
+
   if (phase === 'picking') {
     const total = positions.length;
     const pickedCount = pickedIndices.length;
@@ -130,14 +253,12 @@ export function CardDeck({
       guideText = `为「${currentPos.nameCn}」挑一张牌（${pickedCount + 1} / ${total}）`;
     }
 
-    const fanSpreadAngle = compact ? 12 : 16;
-    const fanDropY = compact ? 12 : 20;
     const cardSizeClass = compact
-      ? 'h-24 w-[3.6rem] sm:h-28 sm:w-[4.2rem]'
-      : 'h-[6.5rem] w-[3.9rem] sm:h-[7.5rem] sm:w-[4.5rem]';
+      ? 'h-[6.6rem] w-[4rem]'
+      : 'h-[7.5rem] w-[4.5rem]';
     const overlapClass = compact
-      ? '-ml-7 first:ml-0 sm:-ml-8'
-      : '-ml-[2.1rem] first:ml-0 sm:-ml-[2.85rem]';
+      ? '-ml-9 first:ml-0'
+      : '-ml-10 first:ml-0';
 
     return (
       <div className="flex flex-col items-center">
@@ -171,43 +292,100 @@ export function CardDeck({
           </ol>
         )}
 
-        <div
-          ref={scrollRef}
-          className="mt-2 w-full overflow-x-auto px-6 pt-11 pb-9"
-        >
-          <div className="mx-auto flex w-max items-end justify-center">
-            {pool.map((candidate, index) => {
-              const isPicked = pickedIndices.includes(index);
-              const t = pool.length > 1 ? (index / (pool.length - 1)) * 2 - 1 : 0;
-              const angle = t * fanSpreadAngle;
-              const offsetY = Math.round(t * t * fanDropY);
-              const cardStyle = {
-                zIndex: index + 1,
-                '--fan-angle': `${angle.toFixed(2)}deg`,
-                '--fan-y': `${offsetY}px`,
-              } as CSSProperties;
+        <div className="relative mt-2 w-full">
+          <button
+            type="button"
+            onClick={() => nudgeRibbon(-1)}
+            disabled={disabled}
+            aria-label="向左滑动牌堆"
+            className="absolute left-1 top-1/2 z-10 grid h-8 w-8 -translate-y-1/2 cursor-pointer place-items-center rounded-full border border-line-strong bg-surface/90 text-ink-soft shadow-[var(--shadow-paper)] backdrop-blur-xs transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden>
+              <path d="m10 3-5 5 5 5" />
+            </svg>
+          </button>
 
-              return (
-                <button
-                  key={candidate.card.id}
-                  type="button"
-                  onClick={() => handlePick(index)}
-                  disabled={disabled || isPicked || isDone}
-                  tabIndex={isPicked ? -1 : 0}
-                  aria-label={`第 ${index + 1} 张暗牌${isPicked ? '（已选）' : ''}`}
-                  style={cardStyle}
-                  className={`fan-card card-back shrink-0 cursor-pointer ${cardSizeClass} ${overlapClass} ${
-                    isPicked ? 'is-picked' : ''
-                  }`}
-                >
-                  <CardMedallion />
-                </button>
-              );
-            })}
+          <div
+            ref={scrollRef}
+            onScroll={(e) => wrapScroll(e.currentTarget)}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            className="deck-ribbon relative z-0 w-full cursor-grab overflow-x-auto pt-10 pb-6"
+          >
+            <div className="flex w-max items-end px-8">
+              {COPIES.flatMap((copy) =>
+                pool.map((candidate, index) => {
+                  const isPicked = pickedIndices.includes(index);
+                  const isMiddleCopy = copy === 1;
+                  const globalIndex = copy * pool.length + index;
+                  const wavePhase = pool.length > 0 ? (index / pool.length) * Math.PI * 2 * 6 : 0;
+                  const angle = Math.sin(wavePhase) * 2.2;
+                  const offsetY = Math.round((1 - Math.cos(wavePhase)) * 3);
+                  const cardStyle = {
+                    '--fan-z': globalIndex + 1,
+                    '--fan-angle': `${angle.toFixed(2)}deg`,
+                    '--fan-y': `${offsetY}px`,
+                  } as CSSProperties;
+
+                  return (
+                    <button
+                      key={`${copy}-${candidate.card.id}`}
+                      ref={
+                        copy === 0 && index === 0
+                          ? copy0StartRef
+                          : copy === 1 && index === 0
+                            ? copy1StartRef
+                            : undefined
+                      }
+                      type="button"
+                      onClick={() => {
+                        if (suppressClickRef.current) {
+                          suppressClickRef.current = false;
+                          return;
+                        }
+                        handlePick(index);
+                      }}
+                      disabled={disabled || isPicked || isDone}
+                      tabIndex={isMiddleCopy && !isPicked ? 0 : -1}
+                      aria-hidden={!isMiddleCopy || undefined}
+                      aria-label={
+                        isMiddleCopy
+                          ? `第 ${index + 1} 张暗牌${isPicked ? '（已选）' : ''}`
+                          : undefined
+                      }
+                      style={cardStyle}
+                      className={`fan-card card-back shrink-0 cursor-pointer ${cardSizeClass} ${overlapClass} ${
+                        isPicked ? 'is-picked' : ''
+                      }`}
+                    >
+                      <CardMedallion />
+                    </button>
+                  );
+                }),
+              )}
+            </div>
           </div>
+
+          <button
+            type="button"
+            onClick={() => nudgeRibbon(1)}
+            disabled={disabled}
+            aria-label="向右滑动牌堆"
+            className="absolute right-1 top-1/2 z-10 grid h-8 w-8 -translate-y-1/2 cursor-pointer place-items-center rounded-full border border-line-strong bg-surface/90 text-ink-soft shadow-[var(--shadow-paper)] backdrop-blur-xs transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden>
+              <path d="m6 3 5 5-5 5" />
+            </svg>
+          </button>
         </div>
 
-        <div className="mt-1 flex flex-wrap items-center justify-center gap-5 text-sm">
+        <p className="text-center text-xs text-ink-muted">
+          共 {pool.length} 张牌，可左右循环滑动挑选
+        </p>
+
+        <div className="mt-3 flex flex-wrap items-center justify-center gap-5 text-sm">
           <button
             type="button"
             onClick={startShuffle}

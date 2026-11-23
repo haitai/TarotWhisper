@@ -24,9 +24,9 @@ export function shuffle<T>(items: readonly T[]): T[] {
   return copy;
 }
 
-/** 生成用于扇形挑牌的候选暗牌池 */
+/** 生成用于挑牌的候选暗牌池（默认包含过滤后的全副剩余牌） */
 export function createFanPool(
-  size: number,
+  size = allCards.length,
   excludeCardIds?: readonly string[],
 ): DrawnCandidate[] {
   if (size <= 0) return [];

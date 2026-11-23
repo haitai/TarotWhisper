@@ -21,6 +21,20 @@ describe('抽牌工具函数', () => {
     expect([...result].sort((a, b) => a - b)).toEqual(original);
   });
 
+  it('createFanPool 默认返回全部 78 张不重复牌，并支持排除已抽牌', () => {
+    const fullPool = createFanPool();
+    expect(fullPool).toHaveLength(allCards.length);
+    expect(new Set(fullPool.map((item) => item.card.id)).size).toBe(allCards.length);
+
+    const excluded = allCards.slice(0, 5).map((c) => c.id);
+    const remainingPool = createFanPool(undefined, excluded);
+    expect(remainingPool).toHaveLength(allCards.length - excluded.length);
+    const excludedSet = new Set(excluded);
+    remainingPool.forEach((item) => {
+      expect(excludedSet.has(item.card.id)).toBe(false);
+    });
+  });
+
   it('createFanPool 生成指定数量且不重复的候选暗牌', () => {
     const pool = createFanPool(22);
     expect(pool).toHaveLength(22);
